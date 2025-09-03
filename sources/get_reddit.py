@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# TODO add more detailed prints on things being fetched for r/popular so we can see progress
+
 """
 periscope_reddit_combined.py
 
@@ -74,7 +76,7 @@ REQUEST_TIMEOUT_SECS   = 45
 POLITE_DELAY_SEC       = 2.0
 MAX_RETRY_ATTEMPTS     = 6
 WORKERS                = 16
-OUT_DIR                = "data/daily"
+OUT_DIR                = "public/files/source_data/reddit"
 
 # Timezone-aware UTC (py3.11+ has dt.UTC; fallback to timezone.utc)
 UTC = getattr(dt, "UTC", dt.timezone.utc)
