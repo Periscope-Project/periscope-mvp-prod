@@ -736,3 +736,5 @@ if __name__ == "__main__":
 )
 
     print(f"\n✅ Wrote {out_path}")
+
+    #TODO polymarket not enriched properly, need all the other stuff

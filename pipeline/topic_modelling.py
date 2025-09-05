@@ -19,6 +19,8 @@ from gensim.models.phrases import Phrases, Phraser
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+#TODO no limit for topic modelling
+
 # --- flexible column detection helpers ---
 
 def _find_topic_id_col(df: pd.DataFrame) -> str:
