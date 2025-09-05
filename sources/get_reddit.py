@@ -378,7 +378,7 @@ INCLUDE_COMMENTS_CAT  = 0  # can override via CLI (shared flag maps to both)
 CATEGORIES: Dict[str, List[str]] = {
     "Film & TV": ["movies","television","film","box office","hollywood"],
     "Music": ["music","hiphop","kpop","pop","indie","jpop","edm","music news"],
-    "Sports": ["sports","soccer","nba","nfl","formula 1","tennis","cricket","football","premier league","college football"],
+    "Sports": ["sports","soccer","nba","nfl","formula 1","tennis","cricket","football","premier league","college football", "wnba","mlb","cfb"],
     "Fashion": ["fashion","streetwear","menswear","womenswear"],
     "Beauty": ["makeup","skincare","beauty"],
     "Health": ["fitness","nutrition","wellness","health"],
