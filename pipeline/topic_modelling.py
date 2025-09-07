@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-import polymarket_features as pf
+
 
 #TODO no limit for topic modelling
 
@@ -257,63 +257,133 @@ def _build_event_text(
 
 
 
+def _normalize_records(records: Any) -> List[Dict[str, Any]]:
+    """Accept DataFrame, list[dict], dict; always return list[dict]."""
+    if isinstance(records, list):
+        return records
+    if pd is not None and isinstance(records, pd.DataFrame):
+        return records.to_dict(orient="records")
+    if isinstance(records, dict):
+        return [records]
+    raise TypeError(f"Unsupported records type: {type(records)}")
+
+def _maybe_json(val: Any) -> Any:
+    """Parse JSON-in-strings like '["Yes","No"]'."""
+    if isinstance(val, str):
+        s = val.strip()
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                return json.loads(s)
+            except Exception:
+                return val
+    return val
+
+def _coerce_dict(x: Any) -> Dict[str, Any]:
+    """If CSV left dicts as strings, make them real dicts."""
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str) and x.strip():
+        s = x.strip()
+        for candidate in (s, s.replace("'", '"')):
+            try:
+                obj = json.loads(candidate)
+                return obj if isinstance(obj, dict) else {}
+            except Exception:
+                continue
+    return {}
+
+def _build_snapshot_text(rec: Dict[str, Any], include_tag: bool, include_outcomes: bool, include_slug: bool) -> str:
+    # Prefer flattened fields (what your enrich_data outputs)
+    q = rec.get("question")
+    slug = rec.get("slug")
+    tag_label = rec.get("tag_label")
+    outs = rec.get("outcomes")
+
+    # Fallbacks to nested if present
+    market = _coerce_dict(rec.get("market"))
+    tag = _coerce_dict(rec.get("tag"))
+
+    if not q:
+        q = market.get("question") or market.get("title")
+    if include_slug and not slug:
+        slug = market.get("slug")
+    if include_tag and not tag_label:
+        tag_label = tag.get("label")
+
+    outs_txt = ""
+    if include_outcomes:
+        outs = _maybe_json(outs) if outs is not None else _maybe_json(market.get("outcomes"))
+        if isinstance(outs, (list, tuple)):
+            outs_txt = " | ".join(map(str, outs[:6]))
+        elif outs:
+            outs_txt = str(outs)
+
+    parts = []
+    if include_tag and tag_label:
+        parts.append(str(tag_label).strip())
+    if q:
+        parts.append(str(q).strip())
+    if include_slug and slug:
+        parts.append(str(slug).strip())
+    if outs_txt:
+        parts.append(outs_txt.strip())
+    return " ".join(p for p in parts if p)
+
+def _build_event_text(rec: Dict[str, Any], include_title: bool, include_description: bool, include_all_questions: bool) -> str:
+    # Legacy event-style fallback (kept for compatibility)
+    parts = []
+    if include_title and rec.get("title"):
+        parts.append(str(rec["title"]).strip())
+    if include_description and rec.get("description"):
+        parts.append(str(rec["description"]).strip())
+    if include_all_questions and isinstance(rec.get("markets"), list):
+        qs = []
+        for m in rec["markets"]:
+            q = (m.get("question") or m.get("title") or "").strip()
+            if q:
+                qs.append(q)
+        if qs:
+            parts.append(" | ".join(qs[:6]))
+    return " ".join(p for p in parts if p)
+
 def build_bert_corpus_from_polymarket_snapshots(
-    records: List[Dict[str, Any]],
+    records: Any,  # <-- now accepts DataFrame directly
     *,
-    # snapshot-flavored options (recommended to keep the text tight):
+    # snapshot options:
     include_tag: bool = True,
     include_outcomes: bool = True,
     include_slug: bool = False,
-    # legacy-event options (used only if an old event-style record is detected):
+    # legacy options (kept to avoid breaking callers):
     include_title: bool = True,
     include_description: bool = True,
     include_all_questions: bool = True,
-    # modeling options:
+    # modeling:
     model_name: str = "bert-base-uncased",
     max_length: int = 128,
     phrase_min_count: int = 5,
     phrase_threshold: int = 10,
 ) -> Tuple[Dict[str, Any], List[str]]:
-    """
-    Build a BERT-style corpus from *Polymarket market snapshots* (the new schema),
-    while remaining compatible with the *old event* schema.
+    rows = _normalize_records(records)
 
-    INPUT:
-      records: list of dicts. Each dict is either:
-        • NEW: a `market_snapshot`-like record (has `market.question`)
-        • OLD: an event dict (has `markets: [...]`)
-
-    OUTPUT:
-      - tokenized (dict suitable for model .forward / .fit_transform)
-      - docs_with_phrases: one cleaned string per input record
-    """
     cleaned_texts: List[str] = []
+    for rec in rows:
+        if not isinstance(rec, dict):
+            continue
+        market = _coerce_dict(rec.get("market"))
+        has_snapshot = bool(rec.get("question") or market.get("question"))
+        has_event = bool(rec.get("title") or rec.get("description") or isinstance(rec.get("markets"), list))
 
-    for rec in records:
-        market_obj = (rec.get("market") or {})
-        has_snapshot_shape = bool(market_obj.get("question"))
-
-        if has_snapshot_shape:
-            # NEW SCHEMA: build text just from the question (+ small optional enrichments)
-            cleaned = _build_snapshot_text(
-                rec,
-                include_tag=include_tag,
-                include_outcomes=include_outcomes,
-                include_slug=include_slug,
-            )
+        if has_snapshot:
+            txt = _build_snapshot_text(rec, include_tag, include_outcomes, include_slug)
+        elif has_event:
+            txt = _build_event_text(rec, include_title, include_description, include_all_questions)
         else:
-            # OLD SCHEMA: fall back to the previous behavior
-            cleaned = _build_event_text(
-                rec,
-                include_title=include_title,
-                include_description=include_description,
-                include_all_questions=include_all_questions,
-            )
+            txt = str(rec.get("slug") or rec.get("market_id") or market.get("slug") or "").strip()
 
-        cleaned_texts.append(cleaned)
+        cleaned_texts.append(txt or "")
 
-    # Phrase detection (bigrams/trigrams-lite via Phrases)
-    token_lists = [txt.split() for txt in cleaned_texts]
+    # light phrase detection → then BERT tokenize (same as your other builders)
+    token_lists = [t.split() for t in cleaned_texts]
     bigram = Phrases(token_lists, min_count=phrase_min_count, threshold=phrase_threshold)
     phraser = Phraser(bigram)
     docs_with_phrases = [" ".join(phraser[tok]) for tok in token_lists]
@@ -327,6 +397,8 @@ def build_bert_corpus_from_polymarket_snapshots(
         return_tensors="pt",
     )
     return tokenized, docs_with_phrases
+# --- END DROP-IN REPLACEMENT ---
+
 
 def _auto_df(texts, min_df=10, max_df=0.5):
     # drop empties first
@@ -477,7 +549,7 @@ if __name__ == "__main__":
     from datetime import datetime
     import pandas as pd
     import numpy as np
-
+    import polymarket_features as pf
     # ---------- paths ----------
     REPO_ROOT = Path(__file__).resolve().parents[1]   # repo/
     DAILY_DIR = REPO_ROOT / "data" / "daily"

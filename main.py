@@ -3,177 +3,51 @@ from __future__ import annotations
 
 import os
 import json
-from datetime import datetime
+from datetime import datetime, date
+from glob import glob
+from typing import Any
 
+import numpy as np
 import pandas as pd
 import torch
+
+import pipeline.topic_modelling as topic_modelling
+from sources.polymarket import get_polymarket
+from sources.reddit import get_reddit
+from utils import data_helpers, enrich_data
+
+
+
 from sentence_transformers import SentenceTransformer
 
-
-#FIXME fix imports
-
-
-import utils.data_helpers as data_helpers
-import utils.get_polymarket as get_polymarket
-import utils.topic_modelling as topic_modelling
-import utils.enrich_data as enrich_data
-from datetime import date
-import numpy as np
-
-
-print("CUDA available:", torch.cuda.is_available())
+# -----------------------------
+# Config
+# -----------------------------
+PRINT_DEVICE = True
+SKIP_POLY_FETCH = True
+SAVE_DIR = os.environ.get("PERISCOPE_OUT_DIR", "public/files/")
+THRESHOLD = float(os.environ.get("TOPIC_OVERLAP_THRESHOLD", "0.50"))
+REDDIT_DAYS = int(os.environ.get("REDDIT_LOOKBACK_DAYS", "14"))
+MINILM_MODEL = os.environ.get("MINILM_MODEL", "all-MiniLM-L6-v2")
+BERT_MODEL = os.environ.get("BERT_MODEL", "bert-base-uncased")
+MAX_LEN = int(os.environ.get("BERT_MAX_LEN", "128"))
+INCLUDE_TOP_COMMENTS = int(os.environ.get("REDDIT_TOP_COMMENTS", "2"))
+LOCAL_POLY_FALLBACK = os.environ.get("POLYMARKET_FALLBACK_PATH", "").strip()
 
 today = datetime.now().strftime("%d_%m_%y")
 
-# -------- helpers --------
+# -----------------------------
+# Helpers
+# -----------------------------
 def ensure_dir(path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-# -------- Reddit --------
-reddit_df = data_helpers.load_reddit_range(days=14)
-reddit_df = data_helpers.clean_null_df(reddit_df, "text")
-# Normalize time on RAW reddit (adds created_dt + created_iso)
-reddit_df = enrich_data.ensure_created_datetime(reddit_df, tz="Europe/London")
+def out_path(*parts: str) -> str:
+    path = os.path.join(SAVE_DIR, *parts)
+    ensure_dir(path if path.endswith("/") else os.path.dirname(path))
+    return path
 
-# Records for tokenizer
-reddit_records = reddit_df.to_dict(orient="records")
-
-# Tokenize Reddit
-tokenized_reddit, cleaned_reddit_texts = topic_modelling.build_bert_corpus_from_reddit(
-    reddit_records,
-    include_top_comments=2,
-    model_name="bert-base-uncased",
-    max_length=128,
-)
-
-print(f"Clean Reddit texts {len(cleaned_reddit_texts)}")
-
-# -------- Polymarket --------
-# try:
-#     polymarket_json = get_polymarket.get_trending_gamma_events(limit=1000)  # API rate limits ~500
-# except Exception as e:
-#     print(f"Error fetching Polymarket data: {e}")
-#     fallback_path = f"data/daily_polymarket/trending_polymarket_events_{today}.jsonl"
-#     with open(fallback_path, "r", encoding="utf-8") as f:
-#         polymarket_json = json.loads(f.read())
-
-# new polymarket events with tags hardcoded FIXME
-with open("data/daily_polymarket/all_unique_events_05_08_24.json", "r", encoding="utf-8") as f:
-    polymarket_json = json.load(f)
-
-polymarket_df = pd.DataFrame(polymarket_json)
-polymarket_df = data_helpers.clean_null_df(polymarket_df, "title")
-polymarket_df = enrich_data.ensure_created_datetime(polymarket_df, tz="Europe/London")
-
-# Tokenize Polymarket titles as text
-polymarket_records = polymarket_df.to_dict(orient="records")
-
-tokenized_poly, cleaned_poly_texts = topic_modelling.build_bert_corpus_from_polymarket(
-    polymarket_records,
-    include_title=True,
-    include_description=True,
-    include_all_questions=True,
-    model_name="bert-base-uncased",
-    max_length=128,
-)
-
-print(f"Clean poly texts {len(cleaned_poly_texts)}")
-# now len(cleaned_poly_texts) == len(polymarket_records) == 1278
-
-# -------- Fit BERTopic --------
-reddit_topics, reddit_probs, reddit_topic_model = topic_modelling.embed_and_fit(
-    cleaned_reddit_texts,
-    stop_words="english",
-    ngram_range=(1, 3),
-    min_df=0.01,
-    max_df=0.9,
-)
-poly_topics, poly_probs, poly_topic_model = topic_modelling.embed_and_fit(
-    cleaned_poly_texts,
-    stop_words="english",
-    ngram_range=(1, 3),
-    min_df=0.01,
-    max_df=0.9,
-)
-
-print(f"Number of reddit topics: {len(reddit_topics)}")
-print(f"Number of polymarket topics: {len(poly_topics)}")
-
-# -------- Document info + embeddings --------
-reddit_doc_info = reddit_topic_model.get_document_info(cleaned_reddit_texts)
-poly_doc_info   = poly_topic_model.get_document_info(cleaned_poly_texts)
-
-# Save raw doc_info (optional)
-ensure_dir("data/outputs/reddit_doc_info.ndjson")
-reddit_doc_info.to_json("data/outputs/reddit_doc_info.ndjson",
-                        orient="records", lines=True, force_ascii=False)
-ensure_dir("data/outputs/poly_doc_info.ndjson")
-poly_doc_info.to_json("data/outputs/poly_doc_info.ndjson",
-                      orient="records", lines=True, force_ascii=False)
-
-# Encode with MiniLM
-device = "cuda" if torch.cuda.is_available() else "cpu"
-st_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
-enc_reddit = st_model.encode(cleaned_reddit_texts, convert_to_numpy=True, show_progress_bar=True)
-enc_poly   = st_model.encode(cleaned_poly_texts,   convert_to_numpy=True, show_progress_bar=True)
-
-reddit_doc_info["embedding"] = [e.tolist() for e in enc_reddit]
-poly_doc_info["embedding"]   = [e.tolist() for e in enc_poly]
-
-# -------- Centroids --------
-reddit_centroids = topic_modelling.compute_topic_centroids(
-    reddit_doc_info, emb_col="embedding", topic_col="Topic", label_col="Name"
-)
-poly_centroids   = topic_modelling.compute_topic_centroids(
-    poly_doc_info,   emb_col="embedding", topic_col="Topic", label_col="Name"
-)
-#TODO keep names the same Topic, Name, embedding etc
-
-# IMPORTANT: your topic_modelling.compute_topic_centroids() returns columns
-#   topic_id, label, embedding
-# Rename them to what enrich_data expects: Topic, Name, embedding
-if "topic_id" in reddit_centroids.columns:
-    reddit_centroids = reddit_centroids.rename(columns={"topic_id": "Topic"})
-if "label" in reddit_centroids.columns:
-    reddit_centroids = reddit_centroids.rename(columns={"label": "Name"})
-
-if "topic_id" in poly_centroids.columns:
-    poly_centroids = poly_centroids.rename(columns={"topic_id": "Topic"})
-if "label" in poly_centroids.columns:
-    poly_centroids = poly_centroids.rename(columns={"label": "Name"})
-
-
-# -------- Topic overlap (use alignment_df explicitly) --------
-THRESHOLD = 0.50
-alignment_df, sim_matrix = topic_modelling.extract_semantically_overlapping_topics(
-    reddit_centroids, poly_centroids, threshold=THRESHOLD
-)
-
-# Save alignment pairs
-ensure_dir("data/outputs/topic_overlap_alignment.csv")
-alignment_out_path = "data/outputs/topic_overlap_alignment.csv"
-alignment_df.to_csv(alignment_out_path, index=False)
-print(f"Saved alignment (threshold >= {THRESHOLD}) to {alignment_out_path}")
-
-# -------- Build aligned structure --------
-aligned_full = enrich_data.build_exact_aligned_topics_with_dates_and_meta(
-    reddit_centroids=reddit_centroids,
-    polymarket_centroids=poly_centroids,
-    sim_matrix=sim_matrix,                 # still pass; will be ignored since we pass alignment_df
-    reddit_topic_model=reddit_topic_model,
-    polymarket_topic_model=poly_topic_model,
-    reddit_doc_info=reddit_doc_info,
-    poly_doc_info=poly_doc_info,
-    cleaned_reddit_texts=cleaned_reddit_texts,
-    cleaned_poly_texts=cleaned_poly_texts,
-    threshold=THRESHOLD,
-    reddit_raw_df=reddit_df,               # re-enrich with ALL Reddit fields
-    polymarket_raw_df=polymarket_df,       # re-enrich with ALL Polymarket fields
-    alignment_df=alignment_df,             # <-- KEY: use the explicit pairs; avoids sim_matrix DataFrame requirement
-    top_n_words=10,
-)
-
-def json_default(o):
+def json_default(o: Any):
     if isinstance(o, (pd.Timestamp, datetime, date)):
         return o.isoformat()
     if o is pd.NaT:
@@ -186,15 +60,190 @@ def json_default(o):
         return float(o)
     if isinstance(o, set):
         return list(o)
-    # last resort
     return str(o)
 
+# -----------------------------
+# Device
+# -----------------------------
+device = "cuda" if torch.cuda.is_available() else "cpu"
+if PRINT_DEVICE:
+    print("CUDA available:", torch.cuda.is_available())
 
-# -------- Write output JSON --------
-ensure_dir(f"data/outputs/aligned_topics_full_{today}.json")
-out_path = f"data/outputs/aligned_topics_full_{today}.json"
-with open(out_path, "w", encoding="utf-8") as f:
+# -----------------------------
+# 1) Reddit ingest + normalize
+# -----------------------------
+print("\n[Reddit] Loading…")
+reddit_df = data_helpers.load_reddit_range(root="public/files/source_data/reddit",_glob="reddit_daily_all*.ndjson",days=REDDIT_DAYS)
+reddit_df = data_helpers.clean_null_df(reddit_df, "text")
+reddit_df = enrich_data.ensure_created_datetime(reddit_df, tz="Europe/London")
+reddit_records = reddit_df.to_dict(orient="records")
+
+print("[Reddit] Tokenizing…")
+tokenized_reddit, cleaned_reddit_texts = topic_modelling.build_bert_corpus_from_reddit(
+    reddit_records,
+    include_top_comments=INCLUDE_TOP_COMMENTS,
+    model_name=BERT_MODEL,
+    max_length=MAX_LEN,
+)
+print(f"[Reddit] Clean texts: {len(cleaned_reddit_texts)}")
+
+# -----------------------------
+# 2) Polymarket ingest + normalize
+# -----------------------------
+print("\n[Polymarket] Loading…")
+polymarket_json = None
+
+# Try live first if fetcher present
+if get_polymarket is not None and SKIP_POLY_FETCH is False:
+    try:
+        polymarket_json = get_polymarket.get_polymarket_all()
+        print(f"[Polymarket] Live events fetched: {len(polymarket_json)}")
+    except Exception as e:
+        print(f"[Polymarket] Live fetch failed → {e}")
+
+# Fallbacks
+if polymarket_json is None or SKIP_POLY_FETCH is True:
+    # explicit env fallback path
+    if LOCAL_POLY_FALLBACK and os.path.exists(LOCAL_POLY_FALLBACK):
+        polymarket_json = data_helpers.load_json_or_jsonl(LOCAL_POLY_FALLBACK)
+        print(f"[Polymarket] Loaded fallback: {LOCAL_POLY_FALLBACK}")
+    else:
+        # last-resort: pick the newest JSON in data/daily_polymarket/
+        candidates = sorted(
+            glob("public/files/source_data/polymarket/*.jsonl")
+        )
+        if candidates:
+            latest = candidates[-1]
+            polymarket_json = data_helpers.load_json_or_jsonl(latest)
+            print(f"[Polymarket] Loaded latest local file: {latest}")
+        else:
+            raise RuntimeError("No Polymarket data available (live failed, no local fallback found).")
+
+poly_meta_df = enrich_data.make_polymarket_meta_with_features(polymarket_json)
+poly_meta_df = data_helpers.clean_null_df(poly_meta_df, "tag")
+
+# (optional: save a copy for debugging)
+poly_meta_path = out_path(f"polymarket_meta_{today}.ndjson")
+poly_meta_df.to_json(poly_meta_path, orient="records", lines=True, force_ascii=False)
+print(f"[Save] {poly_meta_path}")
+
+# Compose texts for BERTopic (snapshot-aware)
+poly_records_for_text = poly_meta_df.to_dict(orient="records")
+
+print("[Polymarket] Tokenizing…")
+tokenized_poly, cleaned_poly_texts = topic_modelling.build_bert_corpus_from_polymarket_snapshots(
+    poly_meta_df,
+    include_title=True,
+    include_description=True,
+    include_all_questions=True,
+    model_name=BERT_MODEL,
+    max_length=MAX_LEN,
+)
+print(f"[Polymarket] Clean texts: {len(cleaned_poly_texts)}")
+
+# -----------------------------
+# 3) Fit BERTopic models
+# -----------------------------
+print("\n[Topics] Fitting BERTopic (Reddit)…")
+reddit_topics, reddit_probs, reddit_topic_model = topic_modelling.embed_and_fit(
+    cleaned_reddit_texts,
+    stop_words="english",
+    ngram_range=(1, 3),
+    min_df=0.01,
+    max_df=0.9,
+)
+
+print("[Topics] Fitting BERTopic (Polymarket)…")
+poly_topics, poly_probs, poly_topic_model = topic_modelling.embed_and_fit(
+    cleaned_poly_texts,
+    stop_words="english",
+    ngram_range=(1, 3),
+    min_df=0.01,
+    max_df=0.9,
+)
+
+print(f"[Topics] Reddit topics: {len(reddit_topics)} | Polymarket topics: {len(poly_topics)}")
+
+# -----------------------------
+# 4) Document info + MiniLM embeddings
+# -----------------------------
+print("\n[Embeddings] Document info + MiniLM…")
+reddit_doc_info = reddit_topic_model.get_document_info(cleaned_reddit_texts)
+poly_doc_info   = poly_topic_model.get_document_info(cleaned_poly_texts)
+
+# Save doc_info early (without embeddings)
+reddit_doc_info_path = out_path(f"reddit_doc_info_{today}.ndjson")
+poly_doc_info_path   = out_path(f"poly_doc_info_{today}.ndjson")
+reddit_doc_info.to_json(reddit_doc_info_path, orient="records", lines=True, force_ascii=False)
+poly_doc_info.to_json(poly_doc_info_path, orient="records", lines=True, force_ascii=False)
+print(f"[Save] {reddit_doc_info_path}")
+print(f"[Save] {poly_doc_info_path}")
+
+# Encode with MiniLM
+st_model = SentenceTransformer(MINILM_MODEL, device=device)
+enc_reddit = st_model.encode(cleaned_reddit_texts, convert_to_numpy=True, show_progress_bar=True)
+enc_poly   = st_model.encode(cleaned_poly_texts,   convert_to_numpy=True, show_progress_bar=True)
+
+reddit_doc_info["embedding"] = [e.tolist() for e in enc_reddit]
+poly_doc_info["embedding"]   = [e.tolist() for e in enc_poly]
+
+# -----------------------------
+# 5) Topic centroids
+# -----------------------------
+print("\n[Centroids] Computing…")
+reddit_centroids = topic_modelling.compute_topic_centroids(
+    reddit_doc_info, emb_col="embedding", topic_col="Topic", label_col="Name"
+)
+poly_centroids   = topic_modelling.compute_topic_centroids(
+    poly_doc_info,   emb_col="embedding", topic_col="Topic", label_col="Name"
+)
+
+# Normalize column names if function returned topic_id/label
+if "topic_id" in reddit_centroids.columns:
+    reddit_centroids = reddit_centroids.rename(columns={"topic_id": "Topic"})
+if "label" in reddit_centroids.columns:
+    reddit_centroids = reddit_centroids.rename(columns={"label": "Name"})
+if "topic_id" in poly_centroids.columns:
+    poly_centroids = poly_centroids.rename(columns={"topic_id": "Topic"})
+if "label" in poly_centroids.columns:
+    poly_centroids = poly_centroids.rename(columns={"label": "Name"})
+
+# -----------------------------
+# 6) Overlap/alignment
+# -----------------------------
+print("\n[Align] Extracting overlapping topics…")
+alignment_df, sim_matrix = topic_modelling.extract_semantically_overlapping_topics(
+    reddit_centroids, poly_centroids, threshold=THRESHOLD
+)
+
+alignment_out_path = out_path(f"topic_overlap_alignment_{today}.csv")
+alignment_df.to_csv(alignment_out_path, index=False)
+print(f"[Save] {alignment_out_path} (threshold >= {THRESHOLD})")
+
+# -----------------------------
+# 7) Build aligned JSON (rich)
+# -----------------------------
+print("\n[Build] Full aligned JSON…")
+aligned_full = enrich_data.build_exact_aligned_topics_with_dates_and_meta(
+    reddit_centroids=reddit_centroids,
+    polymarket_centroids=poly_centroids,
+    sim_matrix=sim_matrix,
+    reddit_topic_model=reddit_topic_model,
+    polymarket_topic_model=poly_topic_model,
+    reddit_doc_info=reddit_doc_info,
+    poly_doc_info=poly_doc_info,
+    cleaned_reddit_texts=cleaned_reddit_texts,
+    cleaned_poly_texts=cleaned_poly_texts,
+    threshold=THRESHOLD,
+    reddit_raw_df=reddit_df,
+    polymarket_raw_df=polymarket_df,
+    alignment_df=alignment_df,
+    top_n_words=10,
+)
+
+aligned_out_path = out_path(f"aligned_topics_full_{today}.json")
+with open(aligned_out_path, "w", encoding="utf-8") as f:
     json.dump(aligned_full, f, indent=2, ensure_ascii=False, default=json_default)
+print(f"[Save] {aligned_out_path}")
 
-print(f"Wrote aligned full JSON to {out_path}")
-
+print("\n✅ Pipeline complete.")

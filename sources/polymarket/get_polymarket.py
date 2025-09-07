@@ -2,49 +2,66 @@
 # -*- coding: utf-8 -*-
 
 """
-Polymarket exporter → ONE raw JSONL + ONE parsed JSONL (append-as-you-go per tag)
+Polymarket LIVE exporter → ONE raw JSONL (+ optional parsed JSONL)
 
-What you get per market:
-- snapshots: best bid/ask (via /prices BUY/SELL), midpoint, spread (+ optional top-of-book)
-- history:   price timeseries per outcome token (default last 90 days)
-- trades:    BUY/SELL aggregation per outcome (counts, token/value, ratios)
-- parsed:    trimmed, human-usable snapshot per outcome (no huge blobs)
+Only pulls **live** markets:
+  • active=True, archived=False, closed=False at the API
+  • local guard with is_live_market()
 
-Also:
-- tags = union of catalog (/tags) + live-event tags (/events -> /events/{id}/tags)
-- de-duplicates markets across tags (write once per market)
+Speed-ups:
+  • Concurrent fetch of live event tags (/events/{id}/tags) with short TTL cache
+  • Prefetch ALL token midpoints/prices/spreads per tag (one batch per endpoint)
+  • Optional: skip histories and/or trades entirely (default keeps both ON)
+  • Concurrent histories (per token) and trades (per market) when enabled
+  • Per-run caches (token -> history, conditionId -> trades_summary)
 """
 
-import os, re, json, time, random, requests
+import os, re, json, time, random, requests, argparse
 from datetime import datetime, timedelta
 from collections import defaultdict, deque
+from typing import List, Dict, Any, Tuple, Optional, Union
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
-# -------------------- CONFIG --------------------
+# -------------------- CONFIG (tweak via CLI) --------------------
 
 BASE_GAMMA = "https://gamma-api.polymarket.com"
 BASE_CLOB  = "https://clob.polymarket.com"
 BASE_DATA  = "https://data-api.polymarket.com"
 
-HISTORY_DAYS     = 90       # recent history window
-PRICES_INTERVAL  = "1d"     # set to "1h"/"1d"/"max" to use interval mode; None → startTs/endTs
-INCLUDE_BOOKS    = False    # True → fetch top-of-book (heavier)
-TRADES_PAGES     = 3        # pages of 1000 trades per market
-TRADE_SAMPLE_MAX = 0        # set >0 to keep some raw trade rows in raw output
+# Defaults keep everything ON; use --skip-* flags to disable at runtime
+HISTORY_DAYS     = 60         # smaller window for speed (change via --history-days)
+PRICES_INTERVAL  = "1d"       # "1h"/"1d"/"max" or None → startTs/endTs window
+INCLUDE_BOOKS    = False      # books are expensive; keep off unless needed
+TRADES_PAGES     = 1          # pages of 1000 trades per market (keep tiny for speed)
+TRADE_SAMPLE_MAX = 0
 
-# Only process these tag labels (case-insensitive). Empty set → ALL tags.
-TAG_LABEL_ALLOWLIST = set()
+# Only process these tag labels (case-insensitive). Empty set → ALL live tags.
+TAG_LABEL_ALLOWLIST: set[str] = set()
 
-# De-duplication: write each market once even if it belongs to many tags
+# De-dup markets across tags (write once)
 DEDUPE_MARKETS = True
+
+# Concurrency knobs (safe vs. limits)
+MAX_WORKERS_HISTORY = 24
+MAX_WORKERS_TRADES  = 16
+MAX_WORKERS_EVENT_TAGS = 24
+
+HTTP_TIMEOUT_SEC    = 30
+
+# Tag cache (short TTL to reflect live movement)
+TAGS_CACHE_PATH = "polymarket_tags_cache_live.json"
+TAGS_CACHE_TTL_SEC = 10 * 60  # 10 minutes
+USE_TAG_CACHE = True
 
 # Rate-limit buckets (requests per 10s)
 RL_LIMITS = {
     # CLOB
     "CLOB:prices_history": (100, 10.0),
-    "CLOB:prices":         (100, 10.0),  # /price (GET) and /prices (POST)
+    "CLOB:prices":         (100, 10.0),
     "CLOB:midpoints":      (100, 10.0),
     "CLOB:spreads":        (100, 10.0),
     "CLOB:books":          (50,  10.0),
@@ -58,20 +75,24 @@ RL_LIMITS = {
 
 # -------------------- HTTP + BACKOFF --------------------
 
-_buckets = defaultdict(deque)
+_buckets: Dict[str, deque] = defaultdict(deque)
+_bucket_locks: Dict[str, Lock] = defaultdict(Lock)
 
 def _acquire_bucket(key: str):
     limit, window = RL_LIMITS.get(key, (40, 10.0))
-    q = _buckets[key]
-    now = time.monotonic()
-    while q and (now - q[0]) > window:
-        q.popleft()
-    if len(q) >= limit:
-        sleep_for = window - (now - q[0]) + 0.01
+    while True:
+        with _bucket_locks[key]:
+            q = _buckets[key]
+            now = time.monotonic()
+            while q and (now - q[0]) > window:
+                q.popleft()
+            if len(q) < limit:
+                q.append(now)
+                return
+            oldest = q[0]
+        sleep_for = window - (time.monotonic() - oldest) + 0.01
         if sleep_for > 0:
             time.sleep(sleep_for)
-        return _acquire_bucket(key)
-    q.append(now)
 
 def _parse_retry_after(val: str):
     try:
@@ -89,33 +110,34 @@ def _build_session():
         respect_retry_after_header=True,
     )
     s.mount("https://", HTTPAdapter(max_retries=retries))
-    s.headers.update({"User-Agent": "polymarket-export/1.1 (+contact@example.com)"})
+    s.headers.update({"User-Agent": "polymarket-live-export/1.0 (+contact@example.com)"})
     return s
 
 SESSION = _build_session()
 
-def _request(method: str, url: str, *, params=None, json_body=None, bucket=None, max_tries=8, timeout=30):
+def _request(method: str, url: str, *, params=None, json_body=None, bucket=None, max_tries=8, timeout=HTTP_TIMEOUT_SEC):
     tries = 0
     while True:
         if bucket:
             _acquire_bucket(bucket)
-
-        if method == "GET":
-            resp = SESSION.get(url, params=params, timeout=timeout)
-        else:
-            resp = SESSION.post(url, params=params, json=json_body, timeout=timeout)
-
+        try:
+            if method == "GET":
+                resp = SESSION.get(url, params=params, timeout=timeout)
+            else:
+                resp = SESSION.post(url, params=params, json=json_body, timeout=timeout)
+        except requests.RequestException:
+            if tries < max_tries:
+                time.sleep((2 ** tries) * 0.5 + random.uniform(0.05, 0.35))
+                tries += 1
+                continue
+            raise
         if resp.status_code < 400:
             return resp
-
         if resp.status_code == 429 and tries < max_tries:
             ra = _parse_retry_after(resp.headers.get("Retry-After", "")) or ((2 ** tries) * 0.6 + random.uniform(0.05, 0.35))
             time.sleep(ra); tries += 1; continue
-
         if 500 <= resp.status_code < 600 and tries < max_tries:
             time.sleep((2 ** tries) * 0.5 + random.uniform(0.05, 0.35)); tries += 1; continue
-
-        # helpful error print
         try:
             detail = resp.json()
         except Exception:
@@ -127,29 +149,37 @@ def _chunked(seq, n):
     for i in range(0, len(seq), n):
         yield seq[i:i+n]
 
-# -------------------- Helpers: tokens, status, mapping --------------------
+# -------------------- Helpers --------------------
 
 TOKEN_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
 
+def _parse_jsonish(val):
+    if isinstance(val, str):
+        s = val.strip()
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            if "," in s:
+                return [x.strip() for x in s.split(",") if x.strip()]
+            return [s] if s else []
+    return val
+
 def clean_token_ids(tokens):
-    """Filter invalid/empty token ids and dedupe."""
-    out = []
+    out, seen = [], set()
     for t in tokens or []:
-        if isinstance(t, str) and TOKEN_RE.match(t):
-            out.append(t)
-    return sorted(set(out))
-
-def is_live_market(m):
-    """Basic 'live' flag (Gamma markets endpoint already requests active=True)."""
-    if m.get("active") is False: return False
-    if m.get("archived") is True: return False
-    if m.get("closed") is True: return False
-    return True
-
-
+        if t is None:
+            continue
+        s = str(t).strip()
+        if not s:
+            continue
+        ok_decimal = s.isdigit()
+        ok_hex = s.startswith("0x") and len(s) == 66 and all(c in "0123456789abcdefABCDEF" for c in s[2:])
+        if ok_decimal or ok_hex:
+            if s not in seen:
+                seen.add(s); out.append(s)
+    return out
 
 def get_clob_token_ids_from_market(market, digits_only=True):
-    """Return a cleaned list of CLOB token ids from a Gamma market object."""
     ctids = _parse_jsonish(market.get("clobTokenIds")) or []
     if isinstance(ctids, str):
         ctids = [ctids]
@@ -160,79 +190,107 @@ def get_clob_token_ids_from_market(market, digits_only=True):
                 seen.add(t); out.append(t)
     return out
 
-
 def outcomes_with_tokens(market):
-    """Aligned outcome names ↔ token ids."""
     names  = _parse_jsonish(market.get("outcomes")) or []
     if isinstance(names, str):
         names = [names]
-    tokens = get_clob_token_ids_from_market(market)  # <-- CLOB token ids here
+    tokens = get_clob_token_ids_from_market(market)
     L = min(len(names), len(tokens))
     return names[:L], tokens[:L]
 
-# -------------------- GAMMA: tags/markets --------------------
+def is_live_market(m):
+    if m.get("active") is False: return False
+    if m.get("archived") is True: return False
+    if m.get("closed") is True: return False
+    return True
 
-def fetch_catalog_tags(limit=1000, include_template=True, order="label", ascending=True):
-    tags_by_id, offset = {}, 0
+# -------------------- GAMMA: live tag + market discovery --------------------
+
+def _cache_load_tags():
+    if not USE_TAG_CACHE: return None
+    try:
+        if not os.path.exists(TAGS_CACHE_PATH): return None
+        if (time.time() - os.path.getmtime(TAGS_CACHE_PATH)) > TAGS_CACHE_TTL_SEC: return None
+        with open(TAGS_CACHE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _cache_save_tags(tags):
+    if not USE_TAG_CACHE: return
+    try:
+        with open(TAGS_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(tags, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+def fetch_live_events_ids(limit=1000) -> List[str]:
+    ids, off = [], 0
     while True:
         params = {
-            "limit": limit, "offset": offset, "order": order,
-            "ascending": str(ascending).lower(),
-            "include_template": str(include_template).lower(),
+            "active":"true","archived":"false","closed":"false",
+            "order":"volume","ascending":"false","limit":limit,"offset":off
         }
-        r = _request("GET", f"{BASE_GAMMA}/tags", params=params, bucket="GAMMA:tags")
+        r = _request("GET", f"{BASE_GAMMA}/events", params=params, bucket="GAMMA:events", timeout=HTTP_TIMEOUT_SEC)
         batch = r.json() or []
-        for t in batch:
-            if t.get("id") is not None:
-                tags_by_id[t["id"]] = t
+        if not batch: break
+        for e in batch:
+            eid = e.get("id")
+            if eid: ids.append(eid)
         if len(batch) < limit: break
-        offset += limit
-    tags = list(tags_by_id.values())
+        off += limit
+    return ids
+
+def _fetch_one_event_tags(eid: str) -> List[Dict[str, Any]]:
+    try:
+        r = _request("GET", f"{BASE_GAMMA}/events/{eid}/tags", bucket="GAMMA:events", timeout=HTTP_TIMEOUT_SEC)
+        if r.status_code == 404:
+            return []
+        return r.json() or []
+    except Exception:
+        return []
+
+def fetch_live_event_tags_fast() -> List[Dict[str, Any]]:
+    cached = _cache_load_tags()
+    if cached is not None:
+        return cached
+    event_ids = fetch_live_events_ids()
+    merged: Dict[Union[int, str], Dict[str, Any]] = {}
+    if event_ids:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_EVENT_TAGS) as pool:
+            futures = {pool.submit(_fetch_one_event_tags, eid): eid for eid in event_ids}
+            for ft in tqdm(as_completed(futures), total=len(futures), desc="Event tags (live)", unit="evt"):
+                try:
+                    tags = ft.result()
+                except Exception:
+                    tags = []
+                for t in tags:
+                    key: Union[int, str] = t.get("id") if t.get("id") is not None else f"slug:{t.get('slug')}"
+                    merged[key] = t
+    tags = list(merged.values())
     if TAG_LABEL_ALLOWLIST:
         lower = {x.lower() for x in TAG_LABEL_ALLOWLIST}
         tags = [t for t in tags if (t.get("label") or "").lower() in lower]
+    tags = sorted(tags, key=lambda t: ((t.get("label") or "").lower(), (t.get("slug") or "").lower()))
+    _cache_save_tags(tags)
     return tags
 
-def fetch_live_event_tags(limit=1000):
-    events, off = [], 0
-    while True:
-        params = {"active":"true","archived":"false","closed":"false",
-                  "order":"volume","ascending":"false","limit":limit,"offset":off}
-        r = _request("GET", f"{BASE_GAMMA}/events", params=params, bucket="GAMMA:events")
-        batch = r.json() or []
-        events.extend(batch)
-        if len(batch) < limit: break
-        off += limit
-
-    by_key = {}
-    for e in events:
-        eid = e.get("id")
-        if not eid: continue
-        r = _request("GET", f"{BASE_GAMMA}/events/{eid}/tags", bucket="GAMMA:events")
-        if r.status_code == 404:
-            continue
-        for t in (r.json() or []):
-            key = t.get("id") if t.get("id") is not None else f"slug:{t.get('slug')}"
-            by_key[key] = t
-    return list(by_key.values())
-
-def fetch_all_tags_union():
-    # catalog = fetch_catalog_tags()
-    catalog = []
-    live    = fetch_live_event_tags()
-    merged = {}
-    for t in catalog + live:
-        key = t.get("id") if t.get("id") is not None else f"slug:{t.get('slug')}"
-        merged[key] = t
-    # pretty order
-    return sorted(merged.values(), key=lambda t: ((t.get("label") or "").lower(), (t.get("slug") or "").lower()))
-
-def get_markets_for_tag(tag_id, limit=1000):
+def get_live_markets_for_tag(tag_id, limit=1000):
     markets, off = [], 0
     while True:
-        params = {"tag_id": tag_id, "active": True, "limit": limit, "offset": off}
+        params = {
+            "tag_id": tag_id,
+            "active": True,
+            "archived": False,   # enforce live
+            "closed": False,     # enforce live
+            "limit": limit,
+            "offset": off
+        }
         r = _request("GET", f"{BASE_GAMMA}/markets", params=params, bucket="GAMMA:markets")
         batch = r.json() or []
+        if not batch: break
+        # local guard (belt & braces)
+        batch = [m for m in batch if is_live_market(m)]
         markets.extend(batch)
         if len(batch) < limit: break
         off += limit
@@ -240,25 +298,8 @@ def get_markets_for_tag(tag_id, limit=1000):
 
 # -------------------- CLOB: pricing, history, books --------------------
 
-import json
-
-def _parse_jsonish(val):
-    if isinstance(val, str):
-        s = val.strip()
-        try:
-            # Try to parse as JSON first (handles '["Yes","No"]', '["1","2"]', etc.)
-            return json.loads(s)
-        except json.JSONDecodeError:
-            # Fallback: treat "Yes,No" as CSV-ish
-            if "," in s:
-                return [x.strip() for x in s.split(",") if x.strip()]
-            # If it's just a single token like "Yes", you can choose list-or-string:
-            return [s] if s else []
-    return val
-
-
-def get_price_history_for_token(token_id, interval=None, start_ts=None, end_ts=None, fidelity=600): #fidelity 10 hours
-    params = {"market": token_id,"fidelity":str(fidelity)}
+def get_price_history_for_token(token_id, interval=None, start_ts=None, end_ts=None, fidelity=600):
+    params = {"market": str(token_id), "fidelity": str(fidelity)}
     if interval:
         params["interval"] = interval
     else:
@@ -304,14 +345,16 @@ def get_books(token_ids, batch_size=100):
 
 # -------------------- DATA API: trades + aggregation --------------------
 
-def get_trades_for_condition_paged(condition_id, page_limit=1000, max_pages=10, start_ts=None):
+def get_trades_for_condition_paged(condition_id, page_limit=1000, max_pages=1, start_ts=None):
     trades, offset = [], 0
     if not condition_id:
         return trades
     for _ in range(max_pages):
-        r = _request("GET", f"{BASE_DATA}/trades",
-                     params={"market": condition_id, "limit": page_limit, "offset": offset, "takerOnly": "true"},
-                     bucket="DATA:trades")
+        r = _request(
+            "GET", f"{BASE_DATA}/trades",
+            params={"market": condition_id, "limit": page_limit, "offset": offset, "takerOnly": "true"},
+            bucket="DATA:trades"
+        )
         batch = r.json() or []
         if not batch: break
         trades.extend(batch)
@@ -326,14 +369,16 @@ def summarize_trades_by_outcome(trades):
     for t in trades:
         oi = t.get("outcomeIndex"); side = t.get("side")
         if oi is None or side not in ("BUY","SELL"): continue
-        size = float(t.get("size", 0) or 0)
+        size  = float(t.get("size", 0) or 0)
         price = float(t.get("price", 0) or 0)
-        val = size * price
-        node = agg.setdefault(oi, {"BUY":{"count":0,"tokens":0.0,"value":0.0},
-                                   "SELL":{"count":0,"tokens":0.0,"value":0.0}})
+        val   = size * price
+        node = agg.setdefault(oi, {
+            "BUY":{"count":0,"tokens":0.0,"value":0.0},
+            "SELL":{"count":0,"tokens":0.0,"value":0.0}
+        })
         node[side]["count"]  += 1
         node[side]["tokens"] += size
-        node[side]["value"]  += val
+        node[side]["value"]   += val
     for oi, node in agg.items():
         bt, st = node["BUY"]["tokens"], node["SELL"]["tokens"]
         bv, sv = node["BUY"]["value"],  node["SELL"]["value"]
@@ -345,15 +390,15 @@ def summarize_trades_by_outcome(trades):
         node["net_flow_value"]   = bv - sv
     return agg
 
-# -------------------- Writers: raw + parsed --------------------
+# -------------------- Writers --------------------
 
-def build_outcomes_parsed(market, token_snaps, histories, trades_summary):
+def build_outcomes_parsed(market, token_snaps, histories_by_token, trades_summary):
     names, tokens = outcomes_with_tokens(market)
     out = []
     for i, name in enumerate(names):
-        tok = tokens[i] if i < len(tokens) else None
+        tok  = tokens[i] if i < len(tokens) else None
         snap = token_snaps.get(tok, {}) if tok else {}
-        hist = histories.get(tok, []) if tok else []
+        hist = histories_by_token.get(tok, []) if tok else []
         last_price = hist[-1]["p"] if hist and isinstance(hist[-1], dict) and "p" in hist[-1] else None
         out.append({
             "index": i,
@@ -368,7 +413,9 @@ def build_outcomes_parsed(market, token_snaps, histories, trades_summary):
         })
     return out
 
-def write_raw_record(fh_raw, tag, market, token_snaps, histories, trades_summary, trades_sample):
+def write_raw_record(fh_raw, tag, market, token_snaps, histories_by_token, trades_summary, trades_sample):
+    _, tokens = outcomes_with_tokens(market)
+    histories = {tok: histories_by_token.get(tok, []) for tok in tokens}
     record = {
         "record_type": "market_snapshot",
         "collected_at": datetime.utcnow().isoformat(timespec="seconds")+"Z",
@@ -394,8 +441,7 @@ def write_raw_record(fh_raw, tag, market, token_snaps, histories, trades_summary
         record["trades_sample"] = trades_sample[:TRADE_SAMPLE_MAX]
     fh_raw.write(json.dumps(record, ensure_ascii=False) + "\n"); fh_raw.flush()
 
-def write_parsed_record(fh_parsed, tag, market, token_snaps, histories, trades_summary):
-    #FIXME: parsing somehow split outcome into like... characters
+def write_parsed_record(fh_parsed, tag, market, token_snaps, histories_by_token, trades_summary):
     rec = {
         "collected_at": datetime.utcnow().isoformat(timespec="seconds")+"Z",
         "tag": {"label": tag.get("label"), "slug": tag.get("slug")},
@@ -405,100 +451,193 @@ def write_parsed_record(fh_parsed, tag, market, token_snaps, histories, trades_s
             "question": market.get("question"),
             "is_live": is_live_market(market),
         },
-        "outcomes": build_outcomes_parsed(market, token_snaps, histories, trades_summary),
+        "outcomes": build_outcomes_parsed(market, token_snaps, histories_by_token, trades_summary),
     }
     fh_parsed.write(json.dumps(rec, ensure_ascii=False) + "\n"); fh_parsed.flush()
 
-# -------------------- Main streaming per tag --------------------
+# -------------------- Per-tag processor (LIVE ONLY) --------------------
 
 SEEN_MARKETS = set()  # conditionId preferred, fallback to market id
 
-def process_tag(tag, fh_raw, fh_parsed=None):
+def process_tag(tag, fh_raw, fh_parsed=None, *, skip_history=False, skip_trades=False):
     tag_id = tag["id"]
-    markets = get_markets_for_tag(tag_id)
+    markets = get_live_markets_for_tag(tag_id)
+    if not markets:
+        return
 
-    # time window
+    # Keep only live markets early (defensive)
+    markets = [m for m in markets if is_live_market(m)]
+    if not markets:
+        return
+
+    # Time window
     end_ts = int(datetime.utcnow().timestamp())
     start_ts = int((datetime.utcnow() - timedelta(days=HISTORY_DAYS)).timestamp())
 
-    # collect unique token ids for batch snapshots
-    token_ids_all = []
-    per_market_tokens = []
+    # Collect tokens (unique per tag) + per-market mapping
+    token_ids_all: List[str] = []
+    per_market_tokens: List[List[str]] = []
+    market_keys: List[str] = []
+
     for m in markets:
         _, toks = outcomes_with_tokens(m)
         per_market_tokens.append(toks)
         token_ids_all.extend(toks)
+        market_keys.append(m.get("conditionId") or m.get("id"))
+
     token_ids_all = sorted(set(token_ids_all))
 
-    # batch snapshots
-    prices_buy  = get_multiple_market_prices(token_ids_all, side="BUY")
-    prices_sell = get_multiple_market_prices(token_ids_all, side="SELL")
+    # ------------------ Batch snapshots up front ------------------
+    prices_buy  = get_multiple_market_prices(token_ids_all, side="BUY")   # best ask
+    prices_sell = get_multiple_market_prices(token_ids_all, side="SELL")  # best bid
     midpoints   = get_multiple_midpoints(token_ids_all)
     spreads     = get_bid_ask_spreads(token_ids_all)
     books       = get_books(token_ids_all) if INCLUDE_BOOKS else {}
 
-    for m, token_ids in zip(markets, per_market_tokens):
-        key = m.get("conditionId") or m.get("id")
-        if DEDUPE_MARKETS and key in SEEN_MARKETS:
-            continue
-        SEEN_MARKETS.add(key)
+    def _snap_for_token(tok: str):
+        book = books.get(tok) or {}
+        best_bid = (book.get("bids") or [{}])[0] if book else None
+        best_ask = (book.get("asks") or [{}])[0] if book else None
+        return {
+            "price_buy_side":  prices_buy.get(tok),   # best ask
+            "price_sell_side": prices_sell.get(tok),  # best bid
+            "midpoint":        midpoints.get(tok),
+            "spread":          spreads.get(tok),
+            "best_bid":        best_bid,
+            "best_ask":        best_ask,
+        }
 
-        # histories
-        histories = {}
-        for tok in token_ids:
+    # ------------------ Prefetch ALL histories (optional) ------------------
+    histories_cache: Dict[str, Any] = {}
+
+    if not skip_history and token_ids_all:
+        def _fetch_hist(tok: str):
             try:
-                hist = get_price_history_for_token(tok,
-                                                   interval=PRICES_INTERVAL,
-                                                   start_ts=None if PRICES_INTERVAL else start_ts,
-                                                   end_ts=None if PRICES_INTERVAL else end_ts)
-                histories[tok] = hist
+                return tok, get_price_history_for_token(
+                    tok,
+                    interval=PRICES_INTERVAL,
+                    start_ts=None if PRICES_INTERVAL else start_ts,
+                    end_ts=None if PRICES_INTERVAL else end_ts
+                )
             except requests.HTTPError as e:
-                histories[tok] = {"error": str(e)}
+                return tok, {"error": str(e)}
 
-        # trades
-        trades = get_trades_for_condition_paged(m.get("conditionId"), page_limit=1000, max_pages=TRADES_PAGES, start_ts=start_ts)
-        tsum = summarize_trades_by_outcome(trades)
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_HISTORY) as pool:
+            futures = {pool.submit(_fetch_hist, tok): tok for tok in token_ids_all}
+            for ft in tqdm(as_completed(futures), total=len(futures), desc=f"Histories [{tag.get('label','?')}]"):
+                tok, hist = ft.result()
+                histories_cache[tok] = hist
 
-        # token snapshots bundle
-        token_snaps = {}
-        for tok in token_ids:
-            book = books.get(tok) or {}
-            best_bid = (book.get("bids") or [{}])[0] if book else None
-            best_ask = (book.get("asks") or [{}])[0] if book else None
-            token_snaps[tok] = {
-                "price_buy_side":  prices_buy.get(tok),   # best ask
-                "price_sell_side": prices_sell.get(tok),  # best bid
-                "midpoint":        midpoints.get(tok),
-                "spread":          spreads.get(tok),
-                "best_bid":        best_bid,
-                "best_ask":        best_ask,
-            }
-
-        # write both outputs
-        write_raw_record(fh_raw, tag, m, token_snaps, histories, tsum, trades)
-        
-        if fh_parsed:
-            write_parsed_record(fh_parsed, tag, m, token_snaps, histories, tsum)
-
-# -------------------- MAIN --------------------
-
-def main():
-    tags = fetch_all_tags_union()
-    print(f"Total unique tags (catalog ∪ live): {len(tags)}")
-
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    raw_path    = f"polymarket_all_tags_{stamp}_live.jsonl"
-    # parsed_path = f"polymarket_all_tags_{stamp}.parsed.jsonl"
-
-    with open(raw_path, "a", encoding="utf-8") as fh_raw:
-        for tag in tqdm(tags, desc="Tags", unit="tag"):
+    # ------------------ Prefetch trades (optional, per market) --------------
+    trades_cache: Dict[str, Any] = {}
+    if not skip_trades:
+        def _fetch_trades_and_sum(cid: Optional[str]):
+            if not cid:
+                return None, {}
             try:
-                process_tag(tag, fh_raw)   # writes as it goes (after every tag)
-            except Exception as e:
-                print(f"!! Failed tag {tag.get('label')} ({tag.get('id') or tag.get('slug')}): {e}")
+                t = get_trades_for_condition_paged(
+                    cid,
+                    page_limit=1000,
+                    max_pages=TRADES_PAGES,
+                    start_ts=start_ts
+                )
+                return cid, summarize_trades_by_outcome(t)
+            except requests.HTTPError as e:
+                return cid, {"error": str(e)}
+
+        condition_ids = sorted({m.get("conditionId") for m in markets if m.get("conditionId")})
+        if condition_ids:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS_TRADES) as pool:
+                futures = {pool.submit(_fetch_trades_and_sum, cid): cid for cid in condition_ids}
+                for ft in tqdm(as_completed(futures), total=len(futures), desc=f"Trades [{tag.get('label','?')}]"):
+                    cid, tsum = ft.result()
+                    if cid:
+                        trades_cache[cid] = tsum
+
+    # ------------------ Write per-market ------------------
+    for m, token_ids, mkey in zip(markets, per_market_tokens, market_keys):
+        if DEDUPE_MARKETS and mkey in SEEN_MARKETS:
+            continue
+        SEEN_MARKETS.add(mkey)
+
+        token_snaps = {tok: _snap_for_token(tok) for tok in token_ids}
+        histories_by_token = {tok: histories_cache.get(tok, []) for tok in token_ids} if not skip_history else {tok: [] for tok in token_ids}
+        tsum = trades_cache.get(m.get("conditionId"), {}) if not skip_trades else {}
+        trades_sample = []  # reserved for future raw sample keeping
+
+        write_raw_record(fh_raw, tag, m, token_snaps, histories_by_token, tsum, trades_sample)
+        if fh_parsed:
+            write_parsed_record(fh_parsed, tag, m, token_snaps, histories_by_token, tsum)
+
+# -------------------- CLI / MAIN --------------------
+
+def cli():
+    p = argparse.ArgumentParser(description="Polymarket LIVE exporter (fast)")
+    p.add_argument("--parsed", action="store_true", help="Also write parsed JSONL alongside raw")
+    p.add_argument("--include-books", action="store_true", default=False, help="Include books (top-of-book) snapshots")
+    p.add_argument("--trades-pages", type=int, default=TRADES_PAGES, help="Pages of 1000 trades per market (default 1)")
+    p.add_argument("--history-days", type=int, default=HISTORY_DAYS, help="History window in days")
+    p.add_argument("--prices-interval", type=str, default=PRICES_INTERVAL, help='Use "1h","1d","max" or "" for startTs/endTs')
+    p.add_argument("--workers-history", type=int, default=MAX_WORKERS_HISTORY, help="Concurrent workers for history fetch")
+    p.add_argument("--workers-trades", type=int, default=MAX_WORKERS_TRADES, help="Concurrent workers for trades fetch")
+    p.add_argument("--event-tag-workers", type=int, default=MAX_WORKERS_EVENT_TAGS, help="Concurrent workers for /events/{id}/tags")
+    p.add_argument("--allowlist", type=str, default="", help="Comma-separated tag labels to include (case-insensitive)")
+    p.add_argument("--tags-cache-ttl", type=int, default=TAGS_CACHE_TTL_SEC, help="Seconds to keep tags cache (default 600)")
+    p.add_argument("--no-tag-cache", action="store_true", help="Disable tag cache")
+    # big speed levers:
+    p.add_argument("--skip-history", action="store_true", help="Do NOT fetch price histories")
+    p.add_argument("--skip-trades", action="store_true", help="Do NOT fetch trades/aggregations")
+    return p.parse_args()
+
+def get_polymarket_all():
+    global INCLUDE_BOOKS, TRADES_PAGES, HISTORY_DAYS, PRICES_INTERVAL
+    global MAX_WORKERS_HISTORY, MAX_WORKERS_TRADES, MAX_WORKERS_EVENT_TAGS
+    global TAG_LABEL_ALLOWLIST, TAGS_CACHE_TTL_SEC, USE_TAG_CACHE
+
+    args = cli()
+    INCLUDE_BOOKS       = bool(args.include_books)
+    TRADES_PAGES        = int(args.trades_pages)
+    HISTORY_DAYS        = int(args.history_days)
+    PRICES_INTERVAL     = args.prices_interval if args.prices_interval != "" else None
+    MAX_WORKERS_HISTORY = int(args.workers_history)
+    MAX_WORKERS_TRADES  = int(args.workers_trades)
+    MAX_WORKERS_EVENT_TAGS = int(args.event_tag_workers)
+    TAGS_CACHE_TTL_SEC  = int(args.tags_cache_ttl)
+    USE_TAG_CACHE       = not args.no_tag_cache
+
+    if args.allowlist:
+        TAG_LABEL_ALLOWLIST.clear()
+        TAG_LABEL_ALLOWLIST.update({x.strip() for x in args.allowlist.split(",") if x.strip()})
+
+    # 1) Live tag discovery FIRST (fast + cached)
+    tags = fetch_live_event_tags_fast()
+    print(f"Total unique LIVE tags: {len(tags)}")
+    if TAG_LABEL_ALLOWLIST:
+        print("Allowlist active:", TAG_LABEL_ALLOWLIST)
+
+    # 2) Prepare outputs
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    raw_path    = f"polymarket_live_{stamp}.jsonl"
+    parsed_path = f"polymarket_live_{stamp}.parsed.jsonl" if args.parsed else None
+
+    # 3) Stream per tag
+    with open(raw_path, "a", encoding="utf-8") as fh_raw:
+        fh_parsed = None
+        try:
+            if parsed_path:
+                fh_parsed = open(parsed_path, "a", encoding="utf-8")
+            for tag in tqdm(tags, desc="Process LIVE tags", unit="tag"):
+                try:
+                    process_tag(tag, fh_raw, fh_parsed, skip_history=args.skip_history, skip_trades=args.skip_trades)
+                except Exception as e:
+                    print(f"!! Failed tag {tag.get('label')} ({tag.get('id') or tag.get('slug')}): {e}")
+        finally:
+            if fh_parsed and not fh_parsed.closed:
+                fh_parsed.close()
 
     print("✅ Wrote:", raw_path)
-    # print("✅ Wrote:", parsed_path)
+    if parsed_path:
+        print("✅ Wrote:", parsed_path)
 
 if __name__ == "__main__":
-    main()
+    get_polymarket_all()

@@ -7,13 +7,12 @@ import math
 import numpy as np
 import pandas as pd
 
-# Try to import the feature extractor from either location
 try:
-    from utils.polymarket_features import extract_market_features as _extract_market_features
+    from sources.polymarket import polymarket_features as pf
 except Exception:
-    # fallback to top-level module name
-    import polymarket_features as _pf  # type: ignore
-    _extract_market_features = _pf.extract_market_features  # type: ignore
+    import polymarket_features as pf
+
+
 
 
 # ======================================================================================
@@ -119,7 +118,7 @@ def make_polymarket_meta_with_features(poly_raw: Iterable[Dict[str, Any]]) -> pd
     df["outcomes"] = df.apply(lambda r: _jsonish(_mget_market(r, "outcomes")), axis=1)
 
     # compute features (one per input record), then add with 'feat_' prefix
-    feats = [_extract_market_features(rec) for rec in poly_raw]
+    feats = [pf.extract_market_features(rec) for rec in poly_raw]
     feats_df = pd.DataFrame(feats).add_prefix(POLY_FEATURE_PREFIX)
     df = pd.concat([df.reset_index(drop=True), feats_df.reset_index(drop=True)], axis=1)
 
@@ -551,8 +550,9 @@ if __name__ == "__main__":
     from datetime import datetime
     import numpy as np
     import pandas as pd
+    
 
-    # --- repo paths ---
+        # --- repo paths ---
     REPO_ROOT = Path(__file__).resolve().parents[1]
     DAILY_DIR = REPO_ROOT / "data" / "daily"
     OUT_DIR   = REPO_ROOT / "data" / "outputs"
