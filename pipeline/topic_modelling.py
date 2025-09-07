@@ -19,6 +19,9 @@ from gensim.models.phrases import Phrases, Phraser
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+
+import polymarket_features as pf
+
 #TODO no limit for topic modelling
 
 # --- flexible column detection helpers ---
@@ -568,6 +571,12 @@ if __name__ == "__main__":
         phrase_threshold=10,
     )
     
+    # ---------- Keep only non-empty texts + align raw records ----------
+    poly_texts_all = poly_texts
+    mask = [bool(t and t.strip()) for t in poly_texts_all]
+    poly_texts = [t for t, keep in zip(poly_texts_all, mask) if keep]
+    poly_raw_kept = [rec for rec, keep in zip(poly_raw, mask) if keep]
+        
     reddit_texts = [t for t in reddit_texts if t and t.strip()]
     poly_texts   = [t for t in poly_texts   if t and t.strip()]
     
@@ -596,6 +605,26 @@ if __name__ == "__main__":
     # ---------- document info + embeddings ----------
     r_docs = r_model.get_document_info(reddit_texts)
     p_docs = p_model.get_document_info(poly_texts)
+    p_docs["doc_id"] = np.arange(len(p_docs))
+    
+    # Compute features for the *same* kept snapshots:
+    feat_df = pd.DataFrame([pf.extract_market_features(rec) for rec in poly_raw_kept]).add_prefix("feat_")
+    feat_df["doc_id"] = np.arange(len(feat_df))
+
+    # (Optional) attach meta you want to carry:
+    meta_df = pd.DataFrame({
+        "doc_id": np.arange(len(poly_raw_kept)),
+        "market_id": [ (rec.get("market") or {}).get("id") for rec in poly_raw_kept ],
+        "question":  [ (rec.get("market") or {}).get("question") for rec in poly_raw_kept ],
+        "slug":      [ (rec.get("market") or {}).get("slug") for rec in poly_raw_kept ],
+        "outcomes":  [ (rec.get("market") or {}).get("outcomes") for rec in poly_raw_kept ],
+        "active":    [ bool((rec.get("market") or {}).get("active")) for rec in poly_raw_kept ],
+        "archived":  [ bool((rec.get("market") or {}).get("archived")) for rec in poly_raw_kept ],
+        "closed":    [ bool((rec.get("market") or {}).get("closed")) for rec in poly_raw_kept ],
+    })
+
+    # Merge into BERTopic doc table (post-hoc, safe):
+    p_docs = p_docs.merge(meta_df.merge(feat_df, on="doc_id", how="left"), on="doc_id", how="left")
 
     # SentenceTransformer embeddings for centroids
     r_emb = r_st_model.encode(reddit_texts, show_progress_bar=False, convert_to_numpy=True)
