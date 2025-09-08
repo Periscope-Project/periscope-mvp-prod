@@ -89,80 +89,58 @@ tokenized_reddit, cleaned_reddit_texts = topic_modelling.build_bert_corpus_from_
 print(f"[Reddit] Clean texts: {len(cleaned_reddit_texts)}")
 
 # -----------------------------
-# 2) Polymarket ingest + normalize
+# 2) Polymarket ingest + normalize (simple)
 # -----------------------------
 print("\n[Polymarket] Loading…")
 polymarket_json = None
 
-# Try live first if fetcher present
-if get_polymarket is not None and SKIP_POLY_FETCH is False:
+# 1) Try live (and save a raw copy if it works)
+if not SKIP_POLY_FETCH and get_polymarket is not None:
     try:
         polymarket_json = get_polymarket.get_polymarket_all()
         print(f"[Polymarket] Live events fetched: {len(polymarket_json)}")
+
+        ts = datetime.now()
+        live_path = out_path(f"source_data/polymarket/polymarket_live_{ts:%Y-%m-%d_%H%M%S}.jsonl")
+        with open(live_path, "w", encoding="utf-8") as f:
+            for rec in (polymarket_json or []):
+                f.write(json.dumps(rec, ensure_ascii=False, default=json_default) + "\n")
+        print(f"[Save] {live_path}")
     except Exception as e:
         print(f"[Polymarket] Live fetch failed → {e}")
+        polymarket_json = None
 
-# Fallbacks
-if polymarket_json is None or SKIP_POLY_FETCH is True:
-    # explicit env fallback path
-    if LOCAL_POLY_FALLBACK and os.path.exists(LOCAL_POLY_FALLBACK):
-        polymarket_json = data_helpers.load_json_or_jsonl(LOCAL_POLY_FALLBACK)
-        print(f"[Polymarket] Loaded fallback: {LOCAL_POLY_FALLBACK}")
-    else:
-        # last-resort: pick the newest JSON in data/daily_polymarket/
-        candidates = sorted(
-            glob("public/files/source_data/polymarket/*.jsonl")
-        )
-        if candidates:
-            latest = candidates[-1]
-            polymarket_json = data_helpers.load_json_or_jsonl(latest)
-            print(f"[Polymarket] Loaded latest local file: {latest}")
-        else:
-            raise RuntimeError("No Polymarket data available (live failed, no local fallback found).")
-        
-# --- Save RAW Polymarket feed as NDJSON (public/files/source_data/polymarket) ---
-TODAY_YMD = datetime.now().strftime("%Y-%m-%d")
-raw_poly_path = out_path(
-    f"source_data/polymarket/polymarket_live_{TODAY_YMD}_{datetime.now().strftime('%H%M%S')}.jsonl"
-)
+# 2) Fallback: newest local .jsonl
+if not polymarket_json:
+    candidates = sorted(glob("public/files/source_data/polymarket/*.jsonl"))
+    if not candidates:
+        raise RuntimeError("No Polymarket data available (no live + no local .jsonl).")
+    latest = candidates[-1]
+    polymarket_json = data_helpers.load_json_or_jsonl(latest)
+    print(f"[Polymarket] Loaded latest local file: {latest}")
 
-# Normalize input to a list of dicts/strings
-if isinstance(polymarket_json, pd.DataFrame):
-    iterable = polymarket_json.to_dict(orient="records")
-elif isinstance(polymarket_json, dict) and "records" in polymarket_json:
-    iterable = polymarket_json["records"]
-else:
-    iterable = polymarket_json or []
-
-with open(raw_poly_path, "w", encoding="utf-8") as f:
-    for rec in iterable:
-        # if it's already a JSON line string, just write it
-        if isinstance(rec, str):
-            f.write(rec.rstrip("\n") + "\n")
-        else:
-            # use json_default so datetimes/np types serialize cleanly
-            f.write(json.dumps(rec, ensure_ascii=False, default=json_default) + "\n")
-
-print(f"[Save] {raw_poly_path}")
-# -------------------------------------------------------------------------------
-
-# -------------------------------------------------------------------------------
-
-
+# 3) Build meta/features and keep only rows with a non-empty 'question'
 poly_meta_df = enrich_data.make_polymarket_meta_with_features(polymarket_json)
-poly_meta_df = data_helpers.clean_null_df(poly_meta_df, "question")
 
-# (optional: save a copy for debugging)
+# Ensure a 'question' column exists
+if "question" not in poly_meta_df.columns and "market" in poly_meta_df.columns:
+    poly_meta_df["question"] = poly_meta_df["market"].apply(
+        lambda m: (m or {}).get("question") if isinstance(m, dict) else None
+    )
+
+# Filter to non-empty strings (avoids .str accessor issues)
+poly_meta_df = poly_meta_df[poly_meta_df["question"].apply(lambda x: isinstance(x, str) and x.strip())].copy()
+
+# Optional debug save
 poly_meta_path = out_path(f"polymarket_meta_{today}.ndjson")
 poly_meta_df.to_json(poly_meta_path, orient="records", lines=True, force_ascii=False)
 print(f"[Save] {poly_meta_path}")
 
-# Compose texts for BERTopic (snapshot-aware)
-poly_records_for_text = poly_meta_df.to_dict(orient="records")
-
+# 4) Tokenize (pass records, not the DataFrame)
+poly_records = poly_meta_df.to_dict(orient="records")
 print("[Polymarket] Tokenizing…")
 tokenized_poly, cleaned_poly_texts = topic_modelling.build_bert_corpus_from_polymarket_snapshots(
-    poly_meta_df,
+    poly_records,
     include_title=True,
     include_description=True,
     include_all_questions=True,
@@ -170,6 +148,7 @@ tokenized_poly, cleaned_poly_texts = topic_modelling.build_bert_corpus_from_poly
     max_length=MAX_LEN,
 )
 print(f"[Polymarket] Clean texts: {len(cleaned_poly_texts)}")
+
 
 # -----------------------------
 # 3) Fit BERTopic models

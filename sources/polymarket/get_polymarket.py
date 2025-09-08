@@ -640,4 +640,4 @@ def get_polymarket_all():
         print("✅ Wrote:", parsed_path)
 
 if __name__ == "__main__":
-    get_polymarket_all()
+    get_polymarket_all()()

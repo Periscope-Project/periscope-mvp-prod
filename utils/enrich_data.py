@@ -70,8 +70,12 @@ POLY_EXTRA_META     = ["question", "slug", "outcomes"]  # human-usable text bits
 
 
 def _mget_market(row: Dict[str, Any], key: str):
-    m = row.get("market") if isinstance(row, dict) else None
-    return (m or {}).get(key)
+    try:
+        row["market"]
+    except Exception:
+        return None
+
+    return row["market"].get(key) if isinstance(row["market"], dict) else None
 
 
 def _jsonish(x: Any) -> Any:
