@@ -10,7 +10,7 @@ import traceback
 from datetime import datetime, date
 from glob import glob
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import requests
 from requests.exceptions import HTTPError
@@ -43,42 +43,41 @@ SPLIT_ON_400     = os.getenv("LITELLM_SPLIT_ON_400", "1") not in ("0", "false", 
 # You can tune this via env if needed.
 CHAR_CAP_HINT    = int(os.getenv("LITELLM_CHAR_CAP_HINT", "50000"))
 
-# -----------------------------------------------------------------------------
-# API helpers
-# -----------------------------------------------------------------------------
+# If you ever want to force trend_id == group_id in the stitched JSON, flip this:
+OVERWRITE_TREND_ID_WITH_GROUP_ID = False
 
-import json
-
+# -----------------------------------------------------------------------------
+# Tiny JSON helpers for stitching
+# -----------------------------------------------------------------------------
 def _try_load_json(s: str):
     try:
         return json.loads(s)
     except Exception:
         return None
 
-def _inject_group_ids_into_trends(trends, batch_items, *, overwrite_trend_id=False):
+def _inject_group_ids_into_trends(trends, batch_items, *, overwrite_trend_id: bool = OVERWRITE_TREND_ID_WITH_GROUP_ID):
     """
-    Zip model 'trends' with our input batch order and inject programmatic group_id.
-    If overwrite_trend_id=True, force trend_id == group_id; else leave whatever model wrote.
+    Align model 'trends' (output) with our input sub-batch order (batch_items)
+    and inject programmatic group_id. Optionally also overwrite trend_id.
     """
     if not isinstance(trends, list):
         return []
 
     out = []
     # align by position; if lengths mismatch, only zip min length
-    for i, (t, inp) in enumerate(zip(trends, batch_items)):
+    for t, inp in zip(trends, batch_items):
         t = t if isinstance(t, dict) else {}
-        gid = inp.get("group_id")
+        gid = (inp or {}).get("group_id") or (inp or {}).get("id")
         if gid is not None:
             t["group_id"] = gid
             if overwrite_trend_id:
                 t["trend_id"] = gid
-            else:
-                # If model emitted nonsense, you can optionally drop it:
-                # t.pop("trend_id", None)
-                pass
         out.append(t)
     return out
 
+# -----------------------------------------------------------------------------
+# API helpers
+# -----------------------------------------------------------------------------
 def _resolve_api(api_key: str | None = None, base_url: str | None = None) -> tuple[str, Dict[str, str]]:
     """
     Resolve API URL and headers. Uses /v1 path which most LiteLLM proxies expose.
@@ -242,12 +241,12 @@ def _post_with_logging(url, headers, model, prompt, *, max_tokens=2000, temperat
     data = resp.json()
     return data["choices"][0]["message"]["content"].strip()
 
-def _send_or_split(batch, *, url, headers, model, cap_chars, save_dir, batch_idx, enable_split=True):
+def _send_or_split(batch, *, url, headers, model, cap_chars, save_dir, batch_idx, enable_split=True) -> List[Tuple[List[Dict[str, Any]], str]]:
     """
     Try to send the batch. If 400 occurs and multiple items present, split into halves and retry.
     Returns a list of tuples: [(subbatch, content_string), ...] so we can map outputs to inputs.
     """
-    results = []
+    results: List[Tuple[List[Dict[str, Any]], str]] = []
     prompt = make_prompt(batch)
     try:
         content = _post_with_logging(url, headers, model, prompt)
@@ -265,7 +264,7 @@ def _send_or_split(batch, *, url, headers, model, cap_chars, save_dir, batch_idx
                 f.write(str(e))
             raise
 
-        # Split & recurse, **important**: split the batch list as well
+        # Split & recurse
         mid = len(batch) // 2
         left_batch  = batch[:mid]
         right_batch = batch[mid:]
@@ -280,11 +279,9 @@ def _send_or_split(batch, *, url, headers, model, cap_chars, save_dir, batch_idx
         )
         return results
 
-
 # -----------------------------------------------------------------------------
 # Public API
 # -----------------------------------------------------------------------------
-
 def summarize_topics(
     topics: List[Dict[str, Any]] | Dict[str, Any],
     *,
@@ -295,11 +292,18 @@ def summarize_topics(
     filename_prefix: str = "trend_briefs_litellm",
     api_key: str | None = None,
     base_url: str | None = None,
-    show_progress: bool = True,  # 👈 NEW
+    show_progress: bool = True,
 ) -> Dict[str, str]:
     """
     Summarize TopicSignal list and write outputs under save_dir.
-    Returns {"raw_txt": ..., "errors": ..., "combined_json": ...}
+
+    Files written:
+      - litellm/<prefix>_YYYY_MM_DD_HHMMSS.txt            (raw model chunks as text)
+      - api_app/all_trends_YYYY_MM_DD.json                (combined via parse_chunk_json)
+      - api_app/all_trends_WITH_GROUPID_YYYY_MM_DD.json   (canonical stitched w/ programmatic group_id)
+      - litellm/trend_briefs_errors_YYYY_MM_DD_HHMMSS.log (errors, if any)
+
+    Returns paths for those files.
     """
     url, headers = _resolve_api(api_key=api_key, base_url=base_url)
 
@@ -310,6 +314,7 @@ def summarize_topics(
     # keep batches modest to avoid provider limits
     cap = min(cap, CHAR_CAP_HINT)
 
+    # normalize input to list
     items = topics if isinstance(topics, list) else [topics]
 
     today_ymd = datetime.now().strftime("%Y_%m_%d")
@@ -324,8 +329,12 @@ def summarize_topics(
     batches = list(make_batches(items, cap))
     print(f"[litellm] Batches: {len(batches)}  (char cap {cap})")
 
+    # outputs: raw content strings (for raw .txt)
     outputs: List[str] = []
     errors: List[str]  = []
+
+    # NEW: keep (subbatch, content) to stitch canonical JSON
+    batch_results: List[Tuple[List[Dict[str, Any]], str]] = []
 
     it = enumerate(batches, start=1)
     if show_progress:
@@ -343,7 +352,10 @@ def summarize_topics(
                 batch_idx=i,
                 enable_split=SPLIT_ON_400,
             )
-            outputs.extend(parts)
+            # parts is a list of (subbatch, content)
+            for subbatch, content in parts:
+                outputs.append(content)
+                batch_results.append((subbatch, content))
         except Exception as e:
             errors.append(f"BATCH {i} ERROR:\n{e}\n{traceback.format_exc()}")
         finally:
@@ -351,6 +363,7 @@ def summarize_topics(
                 it.set_postfix_str(f"ok={len(outputs)} err={len(errors)}")
         time.sleep(pause)
 
+    # Write raw text responses (one block per successful sub-batch)
     with open(out_txt, "w", encoding="utf-8") as f:
         for c in outputs:
             f.write((c or "") + "\n\n")
@@ -358,11 +371,28 @@ def summarize_topics(
     if errors:
         with open(err_log, "w", encoding="utf-8") as f:
             f.write("\n\n".join(errors))
-        print(f"[litellm] ⚠️ {len(errors)} batches failed → {err_log}")
+        print(f"[litellm] ⚠️ {len(errors)} sub-batches failed → {err_log}")
     else:
-        print("[litellm] 🎉 All batches succeeded.")
+        print("[litellm] 🎉 All sub-batches succeeded.")
 
-    # Try to combine; if parsing fails, still return paths.
+    # NEW: canonical stitched JSON with programmatic group_id injection
+    stitched = {"trends": []}
+    for subbatch, content in batch_results:
+        obj = _try_load_json(content)
+        if not obj or not isinstance(obj, dict):
+            continue
+        trends = obj.get("trends")
+        if not isinstance(trends, list):
+            continue
+        injected = _inject_group_ids_into_trends(trends, subbatch, overwrite_trend_id=OVERWRITE_TREND_ID_WITH_GROUP_ID)
+        stitched["trends"].extend(injected)
+
+    out_json_with_gid = Path(save_dir) / "api_app" / f"all_trends_WITH_GROUPID_{today_ymd}.json"
+    with open(out_json_with_gid, "w", encoding="utf-8") as f:
+        json.dump(stitched, f, ensure_ascii=False, separators=(",", ":"), default=_json_default)
+    print(f"[litellm] ✅ Canonical JSON with programmatic group_id → {out_json_with_gid}")
+
+    # Keep your original combiner (for back-compat dashboards, if any)
     try:
         parse_chunk_json(str(out_txt), str(out_json))
         print(f"[litellm] ✅ Combined JSON → {out_json}")
@@ -371,7 +401,13 @@ def summarize_topics(
             f.write(f"\n\nCOMBINE ERROR:\n{repr(e)}\n{traceback.format_exc()}")
         print(f"[litellm] ⚠️ Combine failed. See {err_log}")
 
-    return {"raw_txt": str(out_txt), "errors": str(err_log), "combined_json": str(out_json)}
+    return {
+        "raw_txt": str(out_txt),
+        "errors": str(err_log),
+        "combined_json": str(out_json),
+        "combined_json_with_group_id": str(out_json_with_gid),
+    }
+
 # -----------------------------------------------------------------------------
 # CLI helpers (optional)
 # -----------------------------------------------------------------------------
@@ -411,6 +447,7 @@ if __name__ == "__main__":
 
         print(f"[litellm] Raw responses: {result['raw_txt']}")
         print(f"[litellm] Combined JSON: {result['combined_json']}")
+        print(f"[litellm] Combined JSON (with group_id): {result['combined_json_with_group_id']}")
 
     except Exception as e:
         print("[litellm] Fatal error:", repr(e))
