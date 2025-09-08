@@ -145,7 +145,7 @@ print(f"[Polymarket] Clean texts: {len(cleaned_poly_texts)}")
 # 3) Fit BERTopic models
 # -----------------------------
 print("\n[Topics] Fitting BERTopic (Reddit)…")
-reddit_topics, reddit_probs, reddit_topic_model = topic_modelling.embed_and_fit(
+reddit_topics, reddit_probs, reddit_topic_model, reddit_embedding_model = topic_modelling.embed_and_fit(
     cleaned_reddit_texts,
     stop_words="english",
     ngram_range=(1, 3),
@@ -153,8 +153,9 @@ reddit_topics, reddit_probs, reddit_topic_model = topic_modelling.embed_and_fit(
     max_df=0.9,
 )
 
+
 print("[Topics] Fitting BERTopic (Polymarket)…")
-poly_topics, poly_probs, poly_topic_model = topic_modelling.embed_and_fit(
+poly_topics, poly_probs, poly_topic_model, poly_embedding_model = topic_modelling.embed_and_fit(
     cleaned_poly_texts,
     stop_words="english",
     ngram_range=(1, 3),
@@ -236,7 +237,7 @@ aligned_full = enrich_data.build_exact_aligned_topics_with_dates_and_meta(
     cleaned_poly_texts=cleaned_poly_texts,
     threshold=THRESHOLD,
     reddit_raw_df=reddit_df,
-    polymarket_raw_df=polymarket_df,
+    polymarket_raw_df=poly_meta_df,
     alignment_df=alignment_df,
     top_n_words=10,
 )
