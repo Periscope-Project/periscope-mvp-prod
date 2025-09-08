@@ -15,7 +15,7 @@ import pipeline.topic_modelling as topic_modelling
 from sources.polymarket import get_polymarket
 from sources.reddit import get_reddit
 from utils import data_helpers, enrich_data
-
+from pipeline.lite_llm import summarize_topics
 
 
 from sentence_transformers import SentenceTransformer
@@ -25,6 +25,7 @@ from sentence_transformers import SentenceTransformer
 # -----------------------------
 PRINT_DEVICE = True
 SKIP_POLY_FETCH = True
+RUN_LITELLM = True  # flip to False to skip this step
 SAVE_DIR = os.environ.get("PERISCOPE_OUT_DIR", "public/files/")
 THRESHOLD = float(os.environ.get("TOPIC_OVERLAP_THRESHOLD", "0.50"))
 REDDIT_DAYS = int(os.environ.get("REDDIT_LOOKBACK_DAYS", "14"))
@@ -120,19 +121,36 @@ if polymarket_json is None or SKIP_POLY_FETCH is True:
             raise RuntimeError("No Polymarket data available (live failed, no local fallback found).")
         
 # --- Save RAW Polymarket feed as NDJSON (public/files/source_data/polymarket) ---
-TODAY_YMD = datetime.now().strftime("%Y-%m-%d")  # 2025_09_08
+TODAY_YMD = datetime.now().strftime("%Y-%m-%d")
 raw_poly_path = out_path(
     f"source_data/polymarket/polymarket_live_{TODAY_YMD}_{datetime.now().strftime('%H%M%S')}.jsonl"
 )
+
+# Normalize input to a list of dicts/strings
+if isinstance(polymarket_json, pd.DataFrame):
+    iterable = polymarket_json.to_dict(orient="records")
+elif isinstance(polymarket_json, dict) and "records" in polymarket_json:
+    iterable = polymarket_json["records"]
+else:
+    iterable = polymarket_json or []
+
 with open(raw_poly_path, "w", encoding="utf-8") as f:
-    for rec in polymarket_json:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    for rec in iterable:
+        # if it's already a JSON line string, just write it
+        if isinstance(rec, str):
+            f.write(rec.rstrip("\n") + "\n")
+        else:
+            # use json_default so datetimes/np types serialize cleanly
+            f.write(json.dumps(rec, ensure_ascii=False, default=json_default) + "\n")
+
 print(f"[Save] {raw_poly_path}")
+# -------------------------------------------------------------------------------
+
 # -------------------------------------------------------------------------------
 
 
 poly_meta_df = enrich_data.make_polymarket_meta_with_features(polymarket_json)
-poly_meta_df = data_helpers.clean_null_df(poly_meta_df, "tag")
+poly_meta_df = data_helpers.clean_null_df(poly_meta_df, "question")
 
 # (optional: save a copy for debugging)
 poly_meta_path = out_path(f"polymarket_meta_{today}.ndjson")
@@ -258,5 +276,27 @@ aligned_out_path = out_path(f"aligned_topics_full_{today}.json")
 with open(aligned_out_path, "w", encoding="utf-8") as f:
     json.dump(aligned_full, f, indent=2, ensure_ascii=False, default=json_default)
 print(f"[Save] {aligned_out_path}")
+
+if RUN_LITELLM:
+    try:
+        litellm_result = summarize_topics(
+            aligned_full,                 # pass the in-memory TopicSignal list
+            save_dir=SAVE_DIR,            # defaults to "public/files"
+            # Optional overrides (otherwise uses env/module defaults):
+            model_name=os.getenv("LITELLM_MODEL", "vertex_ai/gemini-2.5-pro"),
+            max_chars=int(os.getenv("LITELLM_MAX_CHARS", "300000")),
+            sleep_sec=float(os.getenv("LITELLM_SLEEP_SEC", "0")),
+            # You can pass API creds explicitly; otherwise they’re read from env:
+            # api_key=os.getenv("LITELLM_API_KEY"),
+            # base_url=os.getenv("LITELLM_LOCATION"),
+        )
+
+        print(f"[LiteLLM] Raw responses: {litellm_result['raw_txt']}")
+        print(f"[LiteLLM] Combined JSON: {litellm_result['combined_json']}")
+    except Exception as e:
+        # Don't crash the whole pipeline if post-processing fails
+        import traceback
+        print("[LiteLLM] Error while summarizing topics:", repr(e))
+        print(traceback.format_exc())
 
 print("\n✅ Pipeline complete.")
