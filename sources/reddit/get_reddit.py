@@ -684,7 +684,7 @@ def run_popular_pipeline(*, out_ndjson: str, modes: List[str], total_limit: int,
 # =========================
 # Orchestrator / CLI
 # =========================
-def main():
+def fetch_reddit_data():
     parser = argparse.ArgumentParser()
     # Category pipeline args
     parser.add_argument("--categories-mode", choices=["top_day","hot","both"], default="both",
@@ -789,4 +789,4 @@ def main():
     print(f"\n✅ Combined done. Categories wrote {total_cat} rows; Popular wrote {total_pop} rows → {out_ndjson}")
 
 if __name__ == "__main__":
-    main()
+    fetch_reddit_data()

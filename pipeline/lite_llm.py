@@ -1,63 +1,71 @@
-# litellm.py
+# pipeline/lite_llm.py
+from __future__ import annotations
+
 import os
+import sys
 import json
 import textwrap
 import time
 import traceback
-from datetime import datetime
-from multiprocessing import Pool, cpu_count
+from datetime import datetime, date
 from glob import glob
 from pathlib import Path
 from typing import Any, Dict, List
 
 import requests
+from requests.exceptions import HTTPError
 from dotenv import load_dotenv
 from tqdm import tqdm
+import pandas as pd
+import numpy as np
 
+# -----------------------------------------------------------------------------
+# Ensure repo root on sys.path so `from utils...` works when running this file.
+# -----------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[1]  # …/periscope-mvp-prod
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+from utils.data_helpers import parse_chunk_json  # now importable from anywhere
 
-
-# ── ENV / DEFAULTS ───────────────────────────────────────
+# -----------------------------------------------------------------------------
+# ENV / DEFAULTS
+# -----------------------------------------------------------------------------
 load_dotenv()
 
-# Module-level defaults (overridable via env or function args)
-MODEL_NAME = os.getenv("LITELLM_MODEL", "vertex_ai/gemini-2.5-pro")
-MAX_CHARS  = int(os.getenv("LITELLM_MAX_CHARS", "300000"))
-SLEEP_SEC  = float(os.getenv("LITELLM_SLEEP_SEC", "0"))
+MODEL_NAME       = os.getenv("LITELLM_MODEL", "vertex_ai/gemini-2.5-pro")
+MAX_CHARS        = int(os.getenv("LITELLM_MAX_CHARS", "300000"))
+SLEEP_SEC        = float(os.getenv("LITELLM_SLEEP_SEC", "0"))
 SAVE_DIR_DEFAULT = os.getenv("PERISCOPE_OUT_DIR", "public/files")
+SPLIT_ON_400     = os.getenv("LITELLM_SPLIT_ON_400", "1") not in ("0", "false", "False")
 
-def _parse_chunk_json_safe(in_path: str, out_path: str) -> None:
+# Hard safety cap for request size; many proxies balk at very large prompts.
+# You can tune this via env if needed.
+CHAR_CAP_HINT    = int(os.getenv("LITELLM_CHAR_CAP_HINT", "50000"))
+
+# -----------------------------------------------------------------------------
+# API helpers
+# -----------------------------------------------------------------------------
+def _resolve_api(api_key: str | None = None, base_url: str | None = None) -> tuple[str, Dict[str, str]]:
     """
-    Import parse_chunk_json lazily so lite_llm loads even if package layout
-    varies. Tries utils.data_helpers first, then utils.parse, then package-relative.
+    Resolve API URL and headers. Uses /v1 path which most LiteLLM proxies expose.
     """
-    try:
-        from utils.data_helpers import parse_chunk_json  # local import
-    except Exception:
-        try:
-            from utils.parse import parse_chunk_json
-        except Exception:
-            try:
-                from ..utils.data_helpers import parse_chunk_json  # type: ignore
-            except Exception as e:
-                raise ImportError(
-                    "Could not import parse_chunk_json. Ensure it exists in "
-                    "utils/data_helpers.py or utils/parse.py and run from repo root."
-                ) from e
-    parse_chunk_json(in_path, out_path)
-
-
-def _resolve_api(api_key: str | None = None, base_url: str | None = None):
-    """Resolve API URL and headers from args/env each time (import-safe)."""
     key = api_key or os.getenv("LITELLM_API_KEY")
     base = (base_url or os.getenv("LITELLM_LOCATION") or "").strip().rstrip("/")
     if not key or not base:
         raise RuntimeError("LiteLLM API config missing: set LITELLM_API_KEY and LITELLM_LOCATION")
+
+    # Normalize to /v1
+    if not base.endswith("/v1"):
+        base = f"{base}/v1"
+
     url = f"{base}/chat/completions"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
     return url, headers
 
-# ── FULL PROMPT HEADER ────────────────────────────────────
+# -----------------------------------------------------------------------------
+# Prompt
+# -----------------------------------------------------------------------------
 super_prompt = textwrap.dedent("""\
 You are TrendReporter-Pro, an AI cultural journalist and strategy analyst.
 
@@ -118,9 +126,46 @@ RULES:
 • Cite all key factors (volume, velocity, sentiment, spread, novelty, market odds, analogues) in `confidence_score_explanation`.
 """)
 
-# ── UTILITIES ────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# JSON helpers
+# -----------------------------------------------------------------------------
+def _json_default(o: Any):
+    # datetime / date
+    if isinstance(o, (pd.Timestamp, datetime, date)):
+        return o.isoformat()
+    if isinstance(o, np.datetime64):
+        return pd.Timestamp(o).isoformat()
+    if o is pd.NaT:
+        return None
+
+    # numpy / pandas scalars
+    if isinstance(o, (np.integer,)):
+        return int(o)
+    if isinstance(o, (np.floating,)):
+        v = float(o)
+        if np.isnan(v) or np.isinf(v):
+            return None
+        return v
+    if isinstance(o, (np.bool_,)):
+        return bool(o)
+
+    # arrays / sets
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, set):
+        return list(o)
+
+    # generic pandas NA
+    try:
+        if pd.isna(o):
+            return None
+    except Exception:
+        pass
+
+    return str(o)
+
 def compact(obj: Any) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, default=_json_default)
 
 def make_prompt(batch: List[Dict[str, Any]]) -> str:
     payload = compact(batch)
@@ -138,7 +183,74 @@ def make_batches(items: List[Dict[str, Any]], max_chars: int):
     if batch:
         yield batch
 
-# ── PUBLIC: summarize callable (import-safe) ─────────────
+# -----------------------------------------------------------------------------
+# Network helpers with good logs + auto split on 400
+# -----------------------------------------------------------------------------
+def _post_with_logging(url, headers, model, prompt, *, max_tokens=2000, temperature=0.2, timeout=120):
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+    try:
+        resp.raise_for_status()
+    except HTTPError as e:
+        # augment with server body for debugging
+        server_text = resp.text or ""
+        raise HTTPError(
+            f"HTTP {resp.status_code} from {url}\n"
+            f"Model: {model}\n"
+            f"Prompt size (chars): {len(prompt)}\n"
+            f"Server said: {server_text[:2000]}",
+            response=resp
+        ) from e
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
+
+def _send_or_split(batch, *, url, headers, model, cap_chars, save_dir, batch_idx, enable_split=True):
+    """
+    Try to send the batch. If 400 occurs and multiple items present, split into halves and retry.
+    Returns a list of content strings (for each successful sub-batch).
+    """
+    outputs: List[str] = []
+    prompt = make_prompt(batch)
+    try:
+        content = _post_with_logging(url, headers, model, prompt)
+        outputs.append(content)
+        return outputs
+    except HTTPError as e:
+        status = getattr(e.response, "status_code", None)
+        if not enable_split or status != 400 or len(batch) <= 1:
+            # Save the failing payload for inspection
+            fail_dir = Path(save_dir) / "litellm" / "failed_batches"
+            fail_dir.mkdir(parents=True, exist_ok=True)
+            with open(fail_dir / f"batch_{batch_idx:04d}.json", "w", encoding="utf-8") as f:
+                f.write(compact(batch))
+            with open(fail_dir / f"batch_{batch_idx:04d}.error.txt", "w", encoding="utf-8") as f:
+                f.write(str(e))
+            # Re-raise so caller records this as an error
+            raise
+
+        # Split & recurse
+        mid = len(batch) // 2
+        left  = batch[:mid]
+        right = batch[mid:]
+        outputs += _send_or_split(
+            left,  url=url, headers=headers, model=model,
+            cap_chars=cap_chars, save_dir=save_dir, batch_idx=batch_idx*2-1, enable_split=enable_split
+        )
+        outputs += _send_or_split(
+            right, url=url, headers=headers, model=model,
+            cap_chars=cap_chars, save_dir=save_dir, batch_idx=batch_idx*2, enable_split=enable_split
+        )
+        return outputs
+
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+
 def summarize_topics(
     topics: List[Dict[str, Any]] | Dict[str, Any],
     *,
@@ -149,16 +261,20 @@ def summarize_topics(
     filename_prefix: str = "trend_briefs_litellm",
     api_key: str | None = None,
     base_url: str | None = None,
+    show_progress: bool = True,  # 👈 NEW
 ) -> Dict[str, str]:
     """
     Summarize TopicSignal list and write outputs under save_dir.
-    Returns paths dict. Safe to call from main.py.
+    Returns {"raw_txt": ..., "errors": ..., "combined_json": ...}
     """
     url, headers = _resolve_api(api_key=api_key, base_url=base_url)
 
     mdl   = model_name or MODEL_NAME
     cap   = max_chars if max_chars is not None else MAX_CHARS
     pause = sleep_sec if sleep_sec is not None else SLEEP_SEC
+
+    # keep batches modest to avoid provider limits
+    cap = min(cap, CHAR_CAP_HINT)
 
     items = topics if isinstance(topics, list) else [topics]
 
@@ -174,17 +290,31 @@ def summarize_topics(
     batches = list(make_batches(items, cap))
     print(f"[litellm] Batches: {len(batches)}  (char cap {cap})")
 
-    outputs, errors = [], []
-    for i, batch in enumerate(batches, start=1):
-        prompt = make_prompt(batch)
-        body = {"model": mdl, "messages": [{"role": "user", "content": prompt}]}
+    outputs: List[str] = []
+    errors: List[str]  = []
+
+    it = enumerate(batches, start=1)
+    if show_progress:
+        it = tqdm(it, total=len(batches), desc="LiteLLM batches", unit="batch")
+
+    for i, batch in it:
         try:
-            resp = requests.post(url, headers=headers, json=body)
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
-            outputs.append(content)
+            parts = _send_or_split(
+                batch,
+                url=url,
+                headers=headers,
+                model=mdl,
+                cap_chars=cap,
+                save_dir=save_dir,
+                batch_idx=i,
+                enable_split=SPLIT_ON_400,
+            )
+            outputs.extend(parts)
         except Exception as e:
-            errors.append(f"BATCH {i} ERROR:\n{repr(e)}\n{traceback.format_exc()}")
+            errors.append(f"BATCH {i} ERROR:\n{e}\n{traceback.format_exc()}")
+        finally:
+            if show_progress and hasattr(it, "set_postfix_str"):
+                it.set_postfix_str(f"ok={len(outputs)} err={len(errors)}")
         time.sleep(pause)
 
     with open(out_txt, "w", encoding="utf-8") as f:
@@ -198,18 +328,25 @@ def summarize_topics(
     else:
         print("[litellm] 🎉 All batches succeeded.")
 
-    _parse_chunk_json_safe(str(out_txt), str(out_json))
-    print(f"[litellm] ✅ Combined JSON → {out_json}")
+    # Try to combine; if parsing fails, still return paths.
+    try:
+        parse_chunk_json(str(out_txt), str(out_json))
+        print(f"[litellm] ✅ Combined JSON → {out_json}")
+    except Exception as e:
+        with open(err_log, "a", encoding="utf-8") as f:
+            f.write(f"\n\nCOMBINE ERROR:\n{repr(e)}\n{traceback.format_exc()}")
+        print(f"[litellm] ⚠️ Combine failed. See {err_log}")
 
     return {"raw_txt": str(out_txt), "errors": str(err_log), "combined_json": str(out_json)}
-
-# ── CLI helpers ──────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# CLI helpers (optional)
+# -----------------------------------------------------------------------------
 def _find_latest_aligned(save_dir: str = SAVE_DIR_DEFAULT) -> str:
     """
     Find newest aligned_topics_full_*.json under common locations.
     Prefers save_dir root; falls back to data/outputs/.
     """
-    candidates = []
+    candidates: List[str] = []
     candidates += glob(str(Path(save_dir) / "aligned_topics_full_*.json"))
     candidates += glob("data/outputs/aligned_topics_full_*.json")
     if not candidates:
@@ -217,80 +354,30 @@ def _find_latest_aligned(save_dir: str = SAVE_DIR_DEFAULT) -> str:
     candidates.sort(key=lambda p: os.path.getmtime(p))
     return candidates[-1]
 
-def _resolve_cli_api():
-    """Resolve URL/HEADERS into globals for CLI multiprocessing path."""
-    url, headers = _resolve_api()
-    globals()["URL"] = url
-    globals()["HEADERS"] = headers
-
-def call_api(args):
-    """
-    Worker for CLI multiprocessing path.
-    args = (index, batch)
-    Returns (index, content_str or None, error_str or None)
-    """
-    idx, batch = args
-    prompt = make_prompt(batch)
-    body = {"model": MODEL_NAME, "messages": [{"role": "user", "content": prompt}]}
-    try:
-        resp = requests.post(URL, headers=HEADERS, json=body)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip()
-        time.sleep(SLEEP_SEC)
-        return idx, content, None
-    except Exception as e:
-        return idx, None, f"{repr(e)}\n{traceback.format_exc()}"
-
-# ── MAIN (standalone CLI) ────────────────────────────────
+# -----------------------------------------------------------------------------
+# Standalone CLI (sequential; uses same logic & logging as summarize_topics)
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # CLI config — can be overridden by env
-    today = datetime.now().strftime("%Y_%m_%d")
-    MODEL_NAME = os.getenv("LITELLM_MODEL", MODEL_NAME)
-    MAX_CHARS  = int(os.getenv("LITELLM_MAX_CHARS", str(MAX_CHARS)))
-    SLEEP_SEC  = float(os.getenv("LITELLM_SLEEP_SEC", str(SLEEP_SEC)))
-    SAVE_DIR   = os.getenv("PERISCOPE_OUT_DIR", SAVE_DIR_DEFAULT)
+    try:
+        url, headers = _resolve_api()
+        SAVE_DIR = os.getenv("PERISCOPE_OUT_DIR", SAVE_DIR_DEFAULT)
+        JSON_PATH = _find_latest_aligned(SAVE_DIR)
+        print(f"[litellm] Using latest aligned file: {JSON_PATH}")
 
-    _resolve_cli_api()
-    JSON_PATH = _find_latest_aligned(SAVE_DIR)
-    print(f"[litellm] Using latest: {JSON_PATH}")
+        with open(JSON_PATH, encoding="utf-8") as f:
+            topics_all = json.load(f)
 
-    with open(JSON_PATH, encoding="utf-8") as f:
-        topics_all = json.load(f)
+        result = summarize_topics(
+            topics_all,
+            save_dir=SAVE_DIR,
+            model_name=os.getenv("LITELLM_MODEL", MODEL_NAME),
+            max_chars=int(os.getenv("LITELLM_MAX_CHARS", str(MAX_CHARS))),
+            sleep_sec=float(os.getenv("LITELLM_SLEEP_SEC", str(SLEEP_SEC))),
+        )
 
-    all_batches = list(make_batches(topics_all, MAX_CHARS))
-    num_batches = len(all_batches)
-    print(f"Total batches to send: {num_batches}")
+        print(f"[litellm] Raw responses: {result['raw_txt']}")
+        print(f"[litellm] Combined JSON: {result['combined_json']}")
 
-    tasks = list(enumerate(all_batches, start=1))
-    results = []
-    with Pool(min(cpu_count(), num_batches)) as pool:
-        for res in tqdm(pool.imap_unordered(call_api, tasks), total=num_batches, desc="Batches"):
-            results.append(res)
-
-    results.sort(key=lambda x: x[0])
-
-    out_txt = Path(SAVE_DIR) / "litellm" / f"trend_briefs_litellm_{today}_{datetime.now():%H%M%S}.txt"
-    err_log = Path(SAVE_DIR) / "litellm" / f"trend_briefs_errors_{today}_{datetime.now():%H%M%S}.log"
-    out_json = Path(SAVE_DIR) / "api_app"  / f"all_trends_{today}.json"
-    out_txt.parent.mkdir(parents=True, exist_ok=True)
-    err_log.parent.mkdir(parents=True, exist_ok=True)
-    out_json.parent.mkdir(parents=True, exist_ok=True)
-
-    outputs, errors = [], []
-    with open(out_txt, "w", encoding="utf-8") as out_f:
-        for idx, content, err in results:
-            if err:
-                errors.append(f"BATCH {idx} ERROR:\n{err}")
-            else:
-                out_f.write(content + "\n\n")
-                outputs.append(content)
-
-    if errors:
-        with open(err_log, "w", encoding="utf-8") as err_f:
-            err_f.write("\n\n".join(errors))
-        print(f"⚠️  {len(errors)} batches failed. See {err_log}")
-    else:
-        print("🎉 All batches succeeded.")
-
-    parse_chunk_json(str(out_txt), str(out_json))
-    print(f"✅ Parsed combined JSON to {out_json}")
+    except Exception as e:
+        print("[litellm] Fatal error:", repr(e))
+        print(traceback.format_exc())

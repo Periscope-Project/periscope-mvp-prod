@@ -2,6 +2,8 @@ data/
 *.json
 *.ndjson
 *jsonl
+*.txt
+*.csv
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

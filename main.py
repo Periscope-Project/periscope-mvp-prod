@@ -121,15 +121,7 @@ if not polymarket_json:
 
 # 3) Build meta/features and keep only rows with a non-empty 'question'
 poly_meta_df = enrich_data.make_polymarket_meta_with_features(polymarket_json)
-
-# Ensure a 'question' column exists
-if "question" not in poly_meta_df.columns and "market" in poly_meta_df.columns:
-    poly_meta_df["question"] = poly_meta_df["market"].apply(
-        lambda m: (m or {}).get("question") if isinstance(m, dict) else None
-    )
-
-# Filter to non-empty strings (avoids .str accessor issues)
-poly_meta_df = poly_meta_df[poly_meta_df["question"].apply(lambda x: isinstance(x, str) and x.strip())].copy()
+poly_meta_df = data_helpers.clean_null_df(poly_meta_df, "question")
 
 # Optional debug save
 poly_meta_path = out_path(f"polymarket_meta_{today}.ndjson")
@@ -266,8 +258,8 @@ if RUN_LITELLM:
             max_chars=int(os.getenv("LITELLM_MAX_CHARS", "300000")),
             sleep_sec=float(os.getenv("LITELLM_SLEEP_SEC", "0")),
             # You can pass API creds explicitly; otherwise they’re read from env:
-            # api_key=os.getenv("LITELLM_API_KEY"),
-            # base_url=os.getenv("LITELLM_LOCATION"),
+            api_key=os.getenv("LITELLM_API_KEY"),
+            base_url=os.getenv("LITELLM_LOCATION"),
         )
 
         print(f"[LiteLLM] Raw responses: {litellm_result['raw_txt']}")
