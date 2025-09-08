@@ -46,6 +46,39 @@ CHAR_CAP_HINT    = int(os.getenv("LITELLM_CHAR_CAP_HINT", "50000"))
 # -----------------------------------------------------------------------------
 # API helpers
 # -----------------------------------------------------------------------------
+
+import json
+
+def _try_load_json(s: str):
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+def _inject_group_ids_into_trends(trends, batch_items, *, overwrite_trend_id=False):
+    """
+    Zip model 'trends' with our input batch order and inject programmatic group_id.
+    If overwrite_trend_id=True, force trend_id == group_id; else leave whatever model wrote.
+    """
+    if not isinstance(trends, list):
+        return []
+
+    out = []
+    # align by position; if lengths mismatch, only zip min length
+    for i, (t, inp) in enumerate(zip(trends, batch_items)):
+        t = t if isinstance(t, dict) else {}
+        gid = inp.get("group_id")
+        if gid is not None:
+            t["group_id"] = gid
+            if overwrite_trend_id:
+                t["trend_id"] = gid
+            else:
+                # If model emitted nonsense, you can optionally drop it:
+                # t.pop("trend_id", None)
+                pass
+        out.append(t)
+    return out
+
 def _resolve_api(api_key: str | None = None, base_url: str | None = None) -> tuple[str, Dict[str, str]]:
     """
     Resolve API URL and headers. Uses /v1 path which most LiteLLM proxies expose.
@@ -85,7 +118,7 @@ No other top-level keys allowed.
 Each object inside "trends" must include these keys, and only these keys, **in this order**:
 
 {
-  "trend_id":           <TopicSignal.id>,
+  "trend_id":           <group_id>,
   "flag_artifact":       <true | false>,  // true ONLY if this topic is artificial noise (e.g., bots, spam, moderator/boilerplate, or otherwise not representing genuine human activity or discourse). DO NOT flag evergreen, organic, or baseline trends as artifacts.
   "maturity_stage":     <"Peak" | "Late-Stage" | "Emerging" | "Early Indicator">,
   "headline":           "<5–8-word hook>",
@@ -212,14 +245,14 @@ def _post_with_logging(url, headers, model, prompt, *, max_tokens=2000, temperat
 def _send_or_split(batch, *, url, headers, model, cap_chars, save_dir, batch_idx, enable_split=True):
     """
     Try to send the batch. If 400 occurs and multiple items present, split into halves and retry.
-    Returns a list of content strings (for each successful sub-batch).
+    Returns a list of tuples: [(subbatch, content_string), ...] so we can map outputs to inputs.
     """
-    outputs: List[str] = []
+    results = []
     prompt = make_prompt(batch)
     try:
         content = _post_with_logging(url, headers, model, prompt)
-        outputs.append(content)
-        return outputs
+        results.append((batch, content))
+        return results
     except HTTPError as e:
         status = getattr(e.response, "status_code", None)
         if not enable_split or status != 400 or len(batch) <= 1:
@@ -230,22 +263,23 @@ def _send_or_split(batch, *, url, headers, model, cap_chars, save_dir, batch_idx
                 f.write(compact(batch))
             with open(fail_dir / f"batch_{batch_idx:04d}.error.txt", "w", encoding="utf-8") as f:
                 f.write(str(e))
-            # Re-raise so caller records this as an error
             raise
 
-        # Split & recurse
+        # Split & recurse, **important**: split the batch list as well
         mid = len(batch) // 2
-        left  = batch[:mid]
-        right = batch[mid:]
-        outputs += _send_or_split(
-            left,  url=url, headers=headers, model=model,
+        left_batch  = batch[:mid]
+        right_batch = batch[mid:]
+
+        results += _send_or_split(
+            left_batch,  url=url, headers=headers, model=model,
             cap_chars=cap_chars, save_dir=save_dir, batch_idx=batch_idx*2-1, enable_split=enable_split
         )
-        outputs += _send_or_split(
-            right, url=url, headers=headers, model=model,
+        results += _send_or_split(
+            right_batch, url=url, headers=headers, model=model,
             cap_chars=cap_chars, save_dir=save_dir, batch_idx=batch_idx*2, enable_split=enable_split
         )
-        return outputs
+        return results
+
 
 # -----------------------------------------------------------------------------
 # Public API

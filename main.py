@@ -25,6 +25,7 @@ from sentence_transformers import SentenceTransformer
 # -----------------------------
 PRINT_DEVICE = True
 SKIP_POLY_FETCH = True
+SKIP_GET_REDDIT = False
 RUN_LITELLM = True  # flip to False to skip this step
 SAVE_DIR = os.environ.get("PERISCOPE_OUT_DIR", "public/files/")
 THRESHOLD = float(os.environ.get("TOPIC_OVERLAP_THRESHOLD", "0.50"))
@@ -73,6 +74,17 @@ if PRINT_DEVICE:
 # -----------------------------
 # 1) Reddit ingest + normalize
 # -----------------------------
+if not SKIP_GET_REDDIT:
+    print("\n[Reddit] Fetching…")
+    reddit_path = get_reddit.fetch_reddit_data(
+        out_dir="public/files/source_data/reddit",
+        days=REDDIT_DAYS,
+        include_top_comments=INCLUDE_TOP_COMMENTS,
+        verbose=True,
+    )
+    print(f"[Reddit] Saved to: {reddit_path}")
+
+
 print("\n[Reddit] Loading…")
 reddit_df = data_helpers.load_reddit_range(root="public/files/source_data/reddit",_glob="reddit_daily_all*.ndjson",days=REDDIT_DAYS)
 reddit_df = data_helpers.clean_null_df(reddit_df, "text")
@@ -244,6 +256,7 @@ aligned_full = enrich_data.build_exact_aligned_topics_with_dates_and_meta(
 )
 
 aligned_out_path = out_path(f"aligned_topics_full_{today}.json")
+
 with open(aligned_out_path, "w", encoding="utf-8") as f:
     json.dump(aligned_full, f, indent=2, ensure_ascii=False, default=json_default)
 print(f"[Save] {aligned_out_path}")
@@ -264,6 +277,12 @@ if RUN_LITELLM:
 
         print(f"[LiteLLM] Raw responses: {litellm_result['raw_txt']}")
         print(f"[LiteLLM] Combined JSON: {litellm_result['combined_json']}")
+        
+        litellm_result = data_helpers._parse_trends(litellm_result)
+        litellm_result_path = out_path(f"trend_briefs_litellm_{today}.json")
+        with open(litellm_result_path, "w", encoding="utf-8") as f:
+            json.dump(litellm_result, f, indent=2, ensure_ascii=False, default=json_default)
+            
     except Exception as e:
         # Don't crash the whole pipeline if post-processing fails
         import traceback
