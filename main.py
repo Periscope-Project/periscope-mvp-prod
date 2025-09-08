@@ -118,6 +118,18 @@ if polymarket_json is None or SKIP_POLY_FETCH is True:
             print(f"[Polymarket] Loaded latest local file: {latest}")
         else:
             raise RuntimeError("No Polymarket data available (live failed, no local fallback found).")
+        
+# --- Save RAW Polymarket feed as NDJSON (public/files/source_data/polymarket) ---
+TODAY_YMD = datetime.now().strftime("%Y-%m-%d")  # 2025_09_08
+raw_poly_path = out_path(
+    f"source_data/polymarket/polymarket_live_{TODAY_YMD}_{datetime.now().strftime('%H%M%S')}.jsonl"
+)
+with open(raw_poly_path, "w", encoding="utf-8") as f:
+    for rec in polymarket_json:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+print(f"[Save] {raw_poly_path}")
+# -------------------------------------------------------------------------------
+
 
 poly_meta_df = enrich_data.make_polymarket_meta_with_features(polymarket_json)
 poly_meta_df = data_helpers.clean_null_df(poly_meta_df, "tag")
