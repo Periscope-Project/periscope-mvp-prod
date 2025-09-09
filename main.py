@@ -286,14 +286,15 @@ if RUN_LITELLM:
             
         print(f"[Save] {litellm_result_path}")
 
-        # --- NEW: push trends into MySQL ---
-        try:
-            rows = load_trends(litellm_result_path)
-            print(f"[SQL] Trend briefs loaded into MySQL: {rows} rows")
-        except Exception as e:
-            import traceback
-            print("[SQL] Failed to load trends into MySQL:", repr(e))
-            print(traceback.format_exc())
+        PUSH_TO_SQL = os.getenv("PUSH_TO_SQL", "1") not in ("0", "false", "False")
+        if PUSH_TO_SQL:
+            try:
+                rows = load_trends(litellm_result_path) #FIXME change from json intermediary to litellm_result
+                print(f"[SQL] Trend briefs loaded into MySQL: {rows} rows")
+            except Exception as e:
+                import traceback
+                print("[SQL] Failed to load trends into MySQL:", repr(e))
+                print(traceback.format_exc())
             
     except Exception as e:
         # Don't crash the whole pipeline if post-processing fails
