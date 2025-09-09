@@ -617,8 +617,8 @@ def get_polymarket_all():
 
     # 2) Prepare outputs
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    raw_path    = f"polymarket_live_{stamp}.jsonl"
-    parsed_path = f"polymarket_live_{stamp}.parsed.jsonl" if args.parsed else None
+    raw_path    = f"public/files/source_data/polymarket/polymarket_live_{stamp}.jsonl" #FIXME out_path move to main
+    parsed_path = f"public/files/source_data/polymarket/polymarket_live_{stamp}.parsed.jsonl" if args.parsed else None #FIXME out_path move to main
 
     # 3) Stream per tag
     with open(raw_path, "a", encoding="utf-8") as fh_raw:
@@ -640,4 +640,8 @@ def get_polymarket_all():
         print("✅ Wrote:", parsed_path)
 
 if __name__ == "__main__":
-    get_polymarket_all()()
+    import os
+    #change to root dir
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    
+    get_polymarket_all()

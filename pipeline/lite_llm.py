@@ -98,6 +98,8 @@ def _resolve_api(api_key: str | None = None, base_url: str | None = None) -> tup
 # -----------------------------------------------------------------------------
 # Prompt
 # -----------------------------------------------------------------------------
+#TODO: add more polymarket stuff and definitions etc etc
+#FIX ME: trend_id , it should just be group id and trend id is just the unique in sql
 super_prompt = textwrap.dedent("""\
 You are TrendReporter-Pro, an AI cultural journalist and strategy analyst.
 
