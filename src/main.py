@@ -41,12 +41,12 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 # Local modules
-import src.pipeline.topic_modelling as topic_modelling
-from src.sources.polymarket import get_polymarket
-from src.sources.reddit import get_reddit
-from src.utils import data_helpers, enrich_data
-from src.pipeline.lite_llm import summarize_topics
-from src.database_utils.data_to_sql import load_trends
+import pipeline.topic_modelling as topic_modelling
+from sources.polymarket import get_polymarket
+from sources.reddit import get_reddit
+from utils import data_helpers, enrich_data
+from pipeline.lite_llm import summarize_topics
+from database_utils.data_to_sql import load_trends
 
 # ───────────────────────────────────────────────────────────────────────────────
 # ENV / CONFIG
@@ -55,8 +55,8 @@ def env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).lower() not in {"0", "false", "no", ""}
 
 PRINT_DEVICE         = env_bool("PRINT_DEVICE", "1")
-SKIP_POLY_FETCH      = env_bool("SKIP_POLY_FETCH", "1")
-SKIP_GET_REDDIT      = env_bool("SKIP_GET_REDDIT", "1")
+SKIP_POLY_FETCH      = env_bool("SKIP_POLY_FETCH", "0")
+SKIP_GET_REDDIT      = env_bool("SKIP_GET_REDDIT", "0")
 RUN_LITELLM          = env_bool("RUN_LITELLM", "0")
 
 SAVE_DIR             = os.getenv("PERISCOPE_OUT_DIR", "public/files/")

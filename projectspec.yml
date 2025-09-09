@@ -1,0 +1,28 @@
+name: periscope
+runtime: python3.11
+
+env:
+  file: .env            # load secrets/DB from here
+
+services:
+  api:
+    command: uvicorn app:app --host 0.0.0.0 --port 8000
+    port: 8000
+    health:
+      path: /health
+      interval: 10s
+      timeout: 2s
+    files_write_dir: public/files
+
+  # optional one-off runner (DevOps can call this, or you call POST /run-pipeline)
+  pipeline:
+    command: python -m src.main
+    env:
+      RUN_SCHEDULE: "0"   # set to "1" if you want code-based daily runs here
+
+scripts:
+  test: pytest -q
+
+notes:
+  - API reads from MySQL; new data appears immediately after a pipeline run.
+  - Use POST /run-pipeline for manual trigger. Avoid enabling in-API scheduler if scaling replicas.
