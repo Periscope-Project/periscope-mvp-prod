@@ -125,7 +125,7 @@ Each object inside "trends" must include these keys, and only these keys, **in t
   "headline":           "<5–8-word hook>",
   "tldr":               "<2–3 sentence summary>",
   "trend_tags":         ["<same as maturity_stage>"],
-  "industry_tags":      ["Entertainment","Fashion","Health","Finance","Tech","Gaming","Retail","Politics","Education","AI/ML","Culture","Others","Humour"],
+  "industry_tags":      Pick one only ["Film & TV","Music","Sports","Fashion","Beauty","Health","Business & Finance","Science & Tech","Gaming","Politics","AI/ML","Internet Culture","Others", "Humour"],
   "cross_platform":     <true | false>,
   "platforms_present":  ["Reddit","Polymarket"],  
   "historical_analogues": [
@@ -258,7 +258,7 @@ def _send_or_split(batch, *, url, headers, model, cap_chars, save_dir, batch_idx
         status = getattr(e.response, "status_code", None)
         if not enable_split or status != 400 or len(batch) <= 1:
             # Save the failing payload for inspection
-            fail_dir = Path(save_dir) / "litellm" / "failed_batches"
+            fail_dir = Path(save_dir) / "litellm_outputs" / "failed_batches"
             fail_dir.mkdir(parents=True, exist_ok=True)
             with open(fail_dir / f"batch_{batch_idx:04d}.json", "w", encoding="utf-8") as f:
                 f.write(compact(batch))
@@ -321,9 +321,9 @@ def summarize_topics(
 
     today_ymd = datetime.now().strftime("%Y_%m_%d")
     ts = datetime.now().strftime("%H%M%S")
-    out_txt  = Path(save_dir) / "litellm" / f"{filename_prefix}_{today_ymd}_{ts}.txt"
-    err_log  = Path(save_dir) / "litellm" / f"trend_briefs_errors_{today_ymd}_{ts}.log"
-    out_json = Path(save_dir) / "api_app"  / f"all_trends_{today_ymd}.json"
+    out_txt  = Path(save_dir) / "litellm_outputs" / f"{filename_prefix}_{today_ymd}_{ts}.txt"
+    err_log  = Path(save_dir) / "litellm_outputs" / f"trend_briefs_errors_{today_ymd}_{ts}.log"
+    out_json = Path(save_dir) / "api_app_outputs"  / f"all_trends_{today_ymd}.json"
     out_txt.parent.mkdir(parents=True, exist_ok=True)
     err_log.parent.mkdir(parents=True, exist_ok=True)
     out_json.parent.mkdir(parents=True, exist_ok=True)

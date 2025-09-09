@@ -5,7 +5,7 @@ import os
 import json
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -13,8 +13,12 @@ from dotenv import load_dotenv
 import mysql.connector as mysql
 from mysql.connector.pooling import MySQLConnectionPool
 
+# pipeline trigger (exported from src/main.py)
+# ensure /opt/periscope/src/__init__.py exists so this import works
+from src.main import run_pipeline
+
 # ── ENV ────────────────────────────────────────────────────────────────────────
-load_dotenv()  # reads .env in the working directory if present
+load_dotenv()  # reads .env in working directory (/opt/periscope/.env)
 
 DB_CONFIG = {
     "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
@@ -24,13 +28,15 @@ DB_CONFIG = {
     "database": os.getenv("MYSQL_DB", "periscope"),
     "charset": "utf8mb4",
 }
+POOL_NAME = os.getenv("DB_POOL_NAME", "periscope_pool")
+POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+CORS_ORIGINS = [o for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o]
 
-POOL_NAME  = os.getenv("DB_POOL_NAME", "periscope_pool")
-POOL_SIZE  = int(os.getenv("DB_POOL_SIZE", "5"))
-
+# ── DB POOL ────────────────────────────────────────────────────────────────────
 pool: Optional[MySQLConnectionPool] = None
 
 def get_conn():
+    """Get a pooled MySQL connection."""
     global pool
     if pool is None:
         pool = MySQLConnectionPool(pool_name=POOL_NAME, pool_size=POOL_SIZE, **DB_CONFIG)
@@ -41,12 +47,12 @@ app = FastAPI(title="Periscope Trends API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("CORS_ALLOW_ORIGINS", "*").split(","),
+    allow_origins=CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── MODELS (response schemas) ──────────────────────────────────────────────────
+# ── MODELS ─────────────────────────────────────────────────────────────────────
 class Trend(BaseModel):
     trend_id: int
     group_id: int
@@ -63,10 +69,13 @@ class Trend(BaseModel):
     confidence_score_explanation: Optional[str] = None
     watch_flag: Optional[str] = None
     watch_rationale: Optional[str] = None
-    outlook: Optional[str] = None          # from prediction_grid
-    why: Optional[str] = None              # from prediction_grid
-    break_point_alerts: Optional[str] = None  # from prediction_grid
+    outlook: Optional[str] = None
+    why: Optional[str] = None
+    break_point_alerts: Optional[str] = None
     created_llm_model: Optional[str] = None
+
+class RunRequest(BaseModel):
+    push_to_sql: Optional[bool] = None  # reserved for future per-request overrides
 
 # ── HELPERS ────────────────────────────────────────────────────────────────────
 JSON_COLS = [
@@ -112,6 +121,7 @@ def feed(
     order: str = Query("trend_id", description="Sort by: trend_id|group_id|confidence_score"),
     desc: bool = Query(True, description="Sort descending"),
 ):
+    conn = cur = None
     try:
         conn = get_conn()
         cur = conn.cursor(dictionary=True)
@@ -135,7 +145,6 @@ def feed(
         if where:
             sql.append("WHERE " + " AND ".join(where))
 
-        # very small, safe allowlist for ORDER BY
         order_map = {
             "trend_id": "t.trend_id",
             "group_id": "t.group_id",
@@ -147,18 +156,20 @@ def feed(
         params.extend([limit, offset])
 
         cur.execute(" ".join(sql), params)
-        rows = [ _parse_json_cols(r) for r in cur.fetchall() ]
+        rows = [_parse_json_cols(r) for r in cur.fetchall()]
         return rows
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         try:
-            cur.close(); conn.close()
+            if cur: cur.close()
+            if conn: conn.close()
         except Exception:
             pass
 
 @app.get("/trends/{trend_id}", response_model=Trend)
 def get_trend(trend_id: int):
+    conn = cur = None
     try:
         conn = get_conn()
         cur = conn.cursor(dictionary=True)
@@ -173,35 +184,64 @@ def get_trend(trend_id: int):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         try:
-            cur.close(); conn.close()
+            if cur: cur.close()
+            if conn: conn.close()
         except Exception:
             pass
 
 @app.get("/groups/{group_id}", response_model=List[Trend])
 def get_group(group_id: int):
+    conn = cur = None
     try:
         conn = get_conn()
         cur = conn.cursor(dictionary=True)
         cur.execute(SELECT_BASE + " WHERE t.group_id = %s ORDER BY t.trend_id DESC", (group_id,))
-        rows = [ _parse_json_cols(r) for r in cur.fetchall() ]
+        rows = [_parse_json_cols(r) for r in cur.fetchall()]
         return rows
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         try:
-            cur.close(); conn.close()
+            if cur: cur.close()
+            if conn: conn.close()
         except Exception:
             pass
 
-# For local run: `uvicorn app:app --host 0.0.0.0 --port 8000 --reload`
+# ── OPTIONAL: manual trigger to run the pipeline once (background) ─────────────
+@app.post("/run-pipeline")
+def run_pipeline_endpoint(bg: BackgroundTasks, req: RunRequest | None = None):
+    """
+    Queues a pipeline run in the background so the HTTP request returns quickly.
+    Real scheduling should be done by cron (python -m src.main).
+    """
+    # If you later want per-request overrides, set env here before calling:
+    # if req and req.push_to_sql is not None:
+    #     os.environ["PUSH_TO_SQL"] = "1" if req.push_to_sql else "0"
+    bg.add_task(run_pipeline)
+    return {"status": "queued"}
+
+# ── OPTIONAL: in-API scheduler (disabled by default) ───────────────────────────
+# Enable with RUN_SCHEDULE_IN_API=1 (use ONLY with a single worker or add a lock)
+if os.getenv("RUN_SCHEDULE_IN_API", "0").lower() in {"1", "true", "yes"}:
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.cron import CronTrigger
+
+        @app.on_event("startup")
+        async def _start_scheduler():
+            tz = os.getenv("SCHEDULE_TZ", "UTC")
+            hour = int(os.getenv("SCHEDULE_HOUR", "2"))
+            minute = int(os.getenv("SCHEDULE_MINUTE", "0"))
+            sched = AsyncIOScheduler(timezone=tz)
+            sched.add_job(run_pipeline, CronTrigger(hour=hour, minute=minute),
+                          id="daily_pipeline", replace_existing=True)
+            sched.start()
+            print(f"⏰ In-API schedule enabled @ {hour:02d}:{minute:02d} {tz}")
+    except Exception as _e:
+        # Scheduler is optional; don't crash the app if it's not installed
+        pass
+
+# ── DEV ONLY: local run ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-
-    # Run on both IPv4 and IPv6 (host "::" binds to all addresses)
-    uvicorn.run(
-        "app:app",
-        host="::",         # IPv6 unspecified address → also covers IPv4 on most OS
-        port=8000,
-        reload=True,       # hot reload in dev, disable in prod
-        log_level="info"
-    )
+    uvicorn.run("app:app", host="::", port=8000, reload=True, log_level="info")

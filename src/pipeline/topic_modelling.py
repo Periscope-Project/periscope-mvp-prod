@@ -19,6 +19,13 @@ from gensim.models.phrases import Phrases, Phraser
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+import torch
+
+print("CUDA available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+
+
 
 
 
@@ -417,23 +424,32 @@ def _auto_df(texts, min_df=10, max_df=0.5):
             min_df_eff = max_allowed_min_df
     return texts, min_df_eff, max_df_eff
 
-def embed_and_fit(texts, stop_words="english", ngram_range=(1, 3),
-                  min_df=10, max_df=0.5, umap_params=None, hdbscan_params=None):
-    # sanitize / auto-tune df thresholds on raw texts (keeps your helper)
+def embed_and_fit(
+    texts,
+    stop_words="english",
+    ngram_range=(1, 3),
+    min_df=10,
+    max_df=0.5,
+    umap_params=None,
+    hdbscan_params=None,
+    device=None,
+):
     texts, min_df_eff, max_df_eff = _auto_df(texts, min_df=min_df, max_df=max_df)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-    
+    # Use GPU for embeddings if available
+    embedding_model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+
     vectorizer = CountVectorizer(
         stop_words=stop_words,
         ngram_range=ngram_range,
         min_df=min_df_eff,
-        max_df=max_df_eff
+        max_df=max_df_eff,
     )
 
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
     umap_model = UMAP(**(umap_params or {"n_neighbors": 15, "min_dist": 0.0}))
     hdbscan_model = HDBSCAN(**(hdbscan_params or {"min_cluster_size": 20}))
+
     topic_model = BERTopic(
         embedding_model=embedding_model,
         vectorizer_model=vectorizer,
@@ -441,20 +457,27 @@ def embed_and_fit(texts, stop_words="english", ngram_range=(1, 3),
         hdbscan_model=hdbscan_model,
         calculate_probabilities=False,
         language="english",
-        verbose=True
+        verbose=True,
     )
 
-    # ---- NEW: retry with relaxed c-TF-IDF thresholds if BERTopic trips the max_df/min_df check
+    # Fit (BERTopic will call embedding_model internally on the chosen device)
     try:
         topics, probs = topic_model.fit_transform(texts)
     except ValueError as e:
         if "max_df corresponds to < documents than min_df" in str(e):
-            # Be permissive for documents-per-topic: ensure always valid even if T is tiny
             topic_model.vectorizer_model.set_params(min_df=1, max_df=0.95)
             topics, probs = topic_model.fit_transform(texts)
         else:
             raise
-    return topics, probs, topic_model,  embedding_model
+
+    # Optional: speed/fidelity tweak on Ampere+ GPUs
+    if device == "cuda":
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+    return topics, probs, topic_model, embedding_model
 
 
 

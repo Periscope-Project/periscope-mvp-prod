@@ -147,7 +147,7 @@ if __name__ == "__main__":
     import argparse, os
     parser = argparse.ArgumentParser()
     parser.add_argument("--path",
-        default=os.path.join("public","files","api_app","all_trends_2025_09_08_171009.json"))
+        default=os.path.join("public","files","api_app_outputs","all_trends_2025_09_08_171009.json"))
     args = parser.parse_args()
     count = load_trends(args.path)
     print(f"Trend briefs loaded: {count} rows (trend_signal_output + prediction_grid by group_id)")
