@@ -16,6 +16,7 @@ from sources.polymarket import get_polymarket
 from sources.reddit import get_reddit
 from utils import data_helpers, enrich_data
 from pipeline.lite_llm import summarize_topics
+from database_utils.data_to_sql import load_trends
 
 
 from sentence_transformers import SentenceTransformer
@@ -281,7 +282,18 @@ if RUN_LITELLM:
         litellm_result = data_helpers._parse_trends(litellm_result)
         litellm_result_path = out_path(f"trend_briefs_litellm_{today}.json")
         with open(litellm_result_path, "w", encoding="utf-8") as f:
-            json.dump(litellm_result, f, indent=2, ensure_ascii=False, default=json_default)
+            json.dump(litellm_result, f, indent=2, ensure_ascii=False, default=json_default) #TODO: remove json intermediaries
+            
+        print(f"[Save] {litellm_result_path}")
+
+        # --- NEW: push trends into MySQL ---
+        try:
+            rows = load_trends(litellm_result_path)
+            print(f"[SQL] Trend briefs loaded into MySQL: {rows} rows")
+        except Exception as e:
+            import traceback
+            print("[SQL] Failed to load trends into MySQL:", repr(e))
+            print(traceback.format_exc())
             
     except Exception as e:
         # Don't crash the whole pipeline if post-processing fails

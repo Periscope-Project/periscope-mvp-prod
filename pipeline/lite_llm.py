@@ -135,7 +135,7 @@ Each object inside "trends" must include these keys, and only these keys, **in t
   ],
   "narrative_analysis": "<3–5 sentence synthesis using keywords, volume, sentiment, platform spread, market odds, analogues. Include velocity (reddit_topic.size ÷ days) and trajectory.>",
   "prediction_grid": {
-    "outlook":          <\"📈 Moderate Growth\" | \"🚀 Breakout Potential\" | \"↔️ Stable Trend\" | \"📉 Declining Signal">,
+    "outlook":          <\"Moderate Growth\" | \"Breakout Potential\" | \"Stable Trend\" | \"Declining Signal">,
     "why":              "<1–2 sentence rationale>",
     "break_point_alerts": "<Events that could trigger a shift>"
   },
