@@ -1,27 +1,32 @@
-# app.py
+"""
+Periscope Trends API
+- Serves read-only data from MySQL (/feed, /trends/{id}, /groups/{id}, /meta, /health)
+- Manual pipeline trigger: POST /run-pipeline  (file-locked to prevent overlap)
+- Optional in-process scheduler (OFF by default; turn on with RUN_SCHEDULE_IN_API=1)
+
+Notes:
+• API always reads straight from MySQL, so new data is visible immediately after a pipeline run.
+• If you scale the API to multiple replicas, keep RUN_SCHEDULE_IN_API=0 and schedule runs outside the API.
+"""
+
 from __future__ import annotations
 
-import os
 import json
+import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from dotenv import load_dotenv
-
-import mysql.connector as mysql
-from mysql.connector.pooling import MySQLConnectionPool
-
-# pipeline trigger (exported from src/main.py)
-# ensure /opt/periscope/src/__init__.py exists so this import works
-from src.main import run_pipeline
-
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from filelock import FileLock, Timeout
-from datetime import datetime
-LOCK_PATH = os.getenv("PIPELINE_LOCK_FILE", "public/files/periscope_pipeline.lock")
+from mysql.connector.pooling import MySQLConnectionPool
+import mysql.connector as mysql
+from pydantic import BaseModel
 
-# ── ENV ────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# ENV
+# ───────────────────────────────────────────────────────────────────────────────
 load_dotenv()  # reads .env in working directory (/opt/periscope/.env)
 
 DB_CONFIG = {
@@ -34,19 +39,46 @@ DB_CONFIG = {
 }
 POOL_NAME = os.getenv("DB_POOL_NAME", "periscope_pool")
 POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+
 CORS_ORIGINS = [o for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",") if o]
 
-# ── DB POOL ────────────────────────────────────────────────────────────────────
+LOCK_PATH = os.getenv("PIPELINE_LOCK_FILE", "/tmp/periscope_pipeline.lock")
+
+RUN_SCHEDULE_IN_API = os.getenv("RUN_SCHEDULE_IN_API", "0").lower() in {"1", "true", "yes"}
+SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Europe/London")
+SCHEDULE_HOUR = int(os.getenv("SCHEDULE_HOUR", "2"))
+SCHEDULE_MINUTE = int(os.getenv("SCHEDULE_MINUTE", "0"))
+
+# ───────────────────────────────────────────────────────────────────────────────
+# IMPORT PIPELINE (must exist: src/__init__.py and src/main.py with run_pipeline)
+# ───────────────────────────────────────────────────────────────────────────────
+# Import late, after env is available.
+from src.main import run_pipeline  # noqa: E402
+
+# ───────────────────────────────────────────────────────────────────────────────
+# DB POOL
+# ───────────────────────────────────────────────────────────────────────────────
 pool: Optional[MySQLConnectionPool] = None
 
 def get_conn():
-    """Get a pooled MySQL connection."""
+    """
+    Get a pooled MySQL connection. Recreate pool on first use.
+    """
     global pool
     if pool is None:
         pool = MySQLConnectionPool(pool_name=POOL_NAME, pool_size=POOL_SIZE, **DB_CONFIG)
-    return pool.get_connection()
+    conn = pool.get_connection()
+    try:
+        # ensure the connection is alive (reconnect=True will reopen transparently)
+        conn.ping(reconnect=True, attempts=1, delay=0)
+    except Exception:
+        # If something odd happens, just return it; connector will raise on use.
+        pass
+    return conn
 
-# ── FASTAPI ────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# FASTAPI APP
+# ───────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Periscope Trends API")
 
 app.add_middleware(
@@ -56,7 +88,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── MODELS ─────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# MODELS
+# ───────────────────────────────────────────────────────────────────────────────
 class Trend(BaseModel):
     trend_id: int
     group_id: int
@@ -81,7 +115,9 @@ class Trend(BaseModel):
 class RunRequest(BaseModel):
     push_to_sql: Optional[bool] = None  # reserved for future per-request overrides
 
-# ── HELPERS ────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ───────────────────────────────────────────────────────────────────────────────
 JSON_COLS = [
     ("trend_tags_json", "trend_tags"),
     ("industry_tags_json", "industry_tags"),
@@ -110,10 +146,62 @@ def _parse_json_cols(row: Dict[str, Any]) -> Dict[str, Any]:
         out.pop(col, None)
     return out
 
-# ── ROUTES ─────────────────────────────────────────────────────────────────────
+def _safe_run_pipeline():
+    """
+    File-locked guard around run_pipeline() to avoid overlapping runs.
+    Works both for manual POST /run-pipeline and in-API scheduler.
+    """
+    try:
+        with FileLock(LOCK_PATH, timeout=1):
+            run_pipeline()
+    except Timeout:
+        # Another run is already in progress. We silently skip.
+        pass
+    except Exception as e:
+        # Log to stdout/stderr; infra will pick this up.
+        print(f"[run_pipeline] error: {e}", flush=True)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# ROUTES
+# ───────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/meta")
+def meta():
+    """
+    Tiny fingerprint so the frontend can detect freshness without pulling the feed.
+    Compare 'version' across polls; if it changes, refetch /feed.
+    """
+    conn = cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(dictionary=True)
+
+        cur.execute("""
+            SELECT
+              MAX(t.trend_id) AS max_trend_id,
+              COUNT(*)        AS total_rows,
+              MAX(t.group_id) AS max_group_id
+            FROM trend_signal_output t
+        """)
+        a = cur.fetchone() or {}
+
+        cur.execute("SELECT COALESCE(MAX(group_id), 0) AS grid_max_group_id FROM prediction_grid")
+        b = cur.fetchone() or {}
+
+        version = f"{a.get('max_trend_id')}-{a.get('total_rows')}-{a.get('max_group_id')}-{b.get('grid_max_group_id')}"
+        return {"version": version, "generated_at": datetime.utcnow().isoformat() + "Z"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
 
 @app.get("/feed", response_model=List[Trend])
 def feed(
@@ -162,6 +250,7 @@ def feed(
         cur.execute(" ".join(sql), params)
         rows = [_parse_json_cols(r) for r in cur.fetchall()]
         return rows
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -211,94 +300,42 @@ def get_group(group_id: int):
         except Exception:
             pass
 
-@app.get("/meta")
-def meta():
-    """
-    Returns a quick-changing fingerprint of the feed so the frontend
-    can detect freshness without pulling the whole list.
-    """
-    conn = cur = None
-    try:
-        conn = get_conn()
-        cur = conn.cursor(dictionary=True)
-
-        # Works even if you don't have updated_at:
-        cur.execute("""
-            SELECT
-              MAX(t.trend_id)           AS max_trend_id,
-              COUNT(*)                  AS total_rows,
-              MAX(t.group_id)           AS max_group_id
-            FROM trend_signal_output t
-        """)
-        a = cur.fetchone() or {}
-
-        # If prediction_grid exists, include its change too
-        cur.execute("SELECT COALESCE(MAX(group_id), 0) AS grid_max_group_id FROM prediction_grid")
-        b = cur.fetchone() or {}
-
-        # Build a compact "version" string front-end can compare
-        version = f"{a.get('max_trend_id')}-{a.get('total_rows')}-{a.get('max_group_id')}-{b.get('grid_max_group_id')}"
-        return {
-            "version": version,
-            "generated_at": datetime.utcnow().isoformat() + "Z"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        try:
-            if cur: cur.close()
-            if conn: conn.close()
-        except Exception:
-            pass
-
-
-# ── OPTIONAL: manual trigger to run the pipeline once (background) ─────────────
 @app.post("/run-pipeline")
 def run_pipeline_endpoint(bg: BackgroundTasks, req: RunRequest | None = None):
     """
-    Queues a pipeline run in the background, with a file lock to avoid overlap.
+    Manual trigger. We start the pipeline in the background and return immediately.
+    The file lock makes sure we don't overlap with an already-running job.
     """
-    def _job():
-        try:
-            with FileLock(LOCK_PATH, timeout=1):
-                run_pipeline()
-        except Timeout:
-            # Another run is in progress; no-op
-            pass
-        except Exception as e:
-            # You can push this to logs/alerts if needed
-            print(f"[run_pipeline] error: {e}", flush=True)
-
-    # Optional per-request override of env flags (leave commented if not needed)
+    # Optional: if you want to override behavior per-request, tweak env here
     # if req and req.push_to_sql is not None:
     #     os.environ["PUSH_TO_SQL"] = "1" if req.push_to_sql else "0"
 
-    bg.add_task(_job)
+    bg.add_task(_safe_run_pipeline)
     return {"status": "queued"}
 
-
-# ── OPTIONAL: in-API scheduler (disabled by default) ───────────────────────────
-# Enable with RUN_SCHEDULE_IN_API=1 (use ONLY with a single worker or add a lock)
-if os.getenv("RUN_SCHEDULE_IN_API", "0").lower() in {"1", "true", "yes"}:
+# ───────────────────────────────────────────────────────────────────────────────
+# OPTIONAL: in-API scheduler (OFF by default)
+# ───────────────────────────────────────────────────────────────────────────────
+if RUN_SCHEDULE_IN_API:
     try:
-        from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler  # type: ignore
+        from apscheduler.triggers.cron import CronTrigger  # type: ignore
 
         @app.on_event("startup")
         async def _start_scheduler():
-            tz = os.getenv("SCHEDULE_TZ", "UTC")
-            hour = int(os.getenv("SCHEDULE_HOUR", "2"))
-            minute = int(os.getenv("SCHEDULE_MINUTE", "0"))
-            sched = AsyncIOScheduler(timezone=tz)
-            sched.add_job(run_pipeline, CronTrigger(hour=hour, minute=minute),
+            sched = AsyncIOScheduler(timezone=SCHEDULE_TZ)
+            # schedule the locked runner to avoid overlaps
+            sched.add_job(_safe_run_pipeline, CronTrigger(hour=SCHEDULE_HOUR, minute=SCHEDULE_MINUTE),
                           id="daily_pipeline", replace_existing=True)
             sched.start()
-            print(f"⏰ In-API schedule enabled @ {hour:02d}:{minute:02d} {tz}")
+            print(f"⏰ In-API schedule enabled @ {SCHEDULE_HOUR:02d}:{SCHEDULE_MINUTE:02d} {SCHEDULE_TZ}")
     except Exception as _e:
-        # Scheduler is optional; don't crash the app if it's not installed
+        # Optional feature; don't crash the API if apscheduler isn't installed
         pass
 
-# ── DEV ONLY: local run ────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# DEV-ONLY: local run
+# ───────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="::", port=8000, reload=True, log_level="info")
