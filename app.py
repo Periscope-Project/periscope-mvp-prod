@@ -17,6 +17,10 @@ from mysql.connector.pooling import MySQLConnectionPool
 # ensure /opt/periscope/src/__init__.py exists so this import works
 from src.main import run_pipeline
 
+from filelock import FileLock, Timeout
+from datetime import datetime
+LOCK_PATH = os.getenv("PIPELINE_LOCK_FILE", "public/files/periscope_pipeline.lock")
+
 # ── ENV ────────────────────────────────────────────────────────────────────────
 load_dotenv()  # reads .env in working directory (/opt/periscope/.env)
 
@@ -207,18 +211,71 @@ def get_group(group_id: int):
         except Exception:
             pass
 
+@app.get("/meta")
+def meta():
+    """
+    Returns a quick-changing fingerprint of the feed so the frontend
+    can detect freshness without pulling the whole list.
+    """
+    conn = cur = None
+    try:
+        conn = get_conn()
+        cur = conn.cursor(dictionary=True)
+
+        # Works even if you don't have updated_at:
+        cur.execute("""
+            SELECT
+              MAX(t.trend_id)           AS max_trend_id,
+              COUNT(*)                  AS total_rows,
+              MAX(t.group_id)           AS max_group_id
+            FROM trend_signal_output t
+        """)
+        a = cur.fetchone() or {}
+
+        # If prediction_grid exists, include its change too
+        cur.execute("SELECT COALESCE(MAX(group_id), 0) AS grid_max_group_id FROM prediction_grid")
+        b = cur.fetchone() or {}
+
+        # Build a compact "version" string front-end can compare
+        version = f"{a.get('max_trend_id')}-{a.get('total_rows')}-{a.get('max_group_id')}-{b.get('grid_max_group_id')}"
+        return {
+            "version": version,
+            "generated_at": datetime.utcnow().isoformat() + "Z"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            if cur: cur.close()
+            if conn: conn.close()
+        except Exception:
+            pass
+
+
 # ── OPTIONAL: manual trigger to run the pipeline once (background) ─────────────
 @app.post("/run-pipeline")
 def run_pipeline_endpoint(bg: BackgroundTasks, req: RunRequest | None = None):
     """
-    Queues a pipeline run in the background so the HTTP request returns quickly.
-    Real scheduling should be done by cron (python -m src.main).
+    Queues a pipeline run in the background, with a file lock to avoid overlap.
     """
-    # If you later want per-request overrides, set env here before calling:
+    def _job():
+        try:
+            with FileLock(LOCK_PATH, timeout=1):
+                run_pipeline()
+        except Timeout:
+            # Another run is in progress; no-op
+            pass
+        except Exception as e:
+            # You can push this to logs/alerts if needed
+            print(f"[run_pipeline] error: {e}", flush=True)
+
+    # Optional per-request override of env flags (leave commented if not needed)
     # if req and req.push_to_sql is not None:
     #     os.environ["PUSH_TO_SQL"] = "1" if req.push_to_sql else "0"
-    bg.add_task(run_pipeline)
+
+    bg.add_task(_job)
     return {"status": "queued"}
+
 
 # ── OPTIONAL: in-API scheduler (disabled by default) ───────────────────────────
 # Enable with RUN_SCHEDULE_IN_API=1 (use ONLY with a single worker or add a lock)
