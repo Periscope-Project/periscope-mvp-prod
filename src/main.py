@@ -47,6 +47,8 @@ from sources.reddit import get_reddit
 from utils import data_helpers, enrich_data
 from pipeline.lite_llm import summarize_topics
 from database_utils.data_to_sql import load_trends
+from database_utils.aligned_data_to_sql import load_aligned_into_erd as load_aligned_topics_to_sql
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # ENV / CONFIG
@@ -58,6 +60,10 @@ PRINT_DEVICE         = env_bool("PRINT_DEVICE", "1")
 SKIP_POLY_FETCH      = env_bool("SKIP_POLY_FETCH", "0")
 SKIP_GET_REDDIT      = env_bool("SKIP_GET_REDDIT", "0")
 RUN_LITELLM          = env_bool("RUN_LITELLM", "0")
+PUSH_ALIGNED_TO_SQL   = os.getenv("PUSH_ALIGNED_TO_SQL", "1").lower() not in {"0","false","no",""}
+ALIGNED_DEFAULT_GROUP = os.getenv("ALIGNED_DEFAULT_GROUP_ID")  # optional fallback if items lack group_id
+ALIGNED_DEFAULT_GROUP = int(ALIGNED_DEFAULT_GROUP) if (ALIGNED_DEFAULT_GROUP and ALIGNED_DEFAULT_GROUP.isdigit()) else None
+
 
 SAVE_DIR             = os.getenv("PERISCOPE_OUT_DIR", "public/files/")
 THRESHOLD            = float(os.getenv("TOPIC_OVERLAP_THRESHOLD", "0.50"))
@@ -179,7 +185,7 @@ def _load_polymarket() -> Tuple[pd.DataFrame, list]:
 
     # Debug save
     today = datetime.now().strftime("%d_%m_%y")
-    meta_path = out_path(f"polymarket_meta_{today}.ndjson")
+    meta_path = out_path(f"logs/polymarket_meta_{today}.ndjson")
     meta_df.to_json(meta_path, orient="records", lines=True, force_ascii=False)
     print(f"[Save] {meta_path}")
 
@@ -237,7 +243,7 @@ def run_pipeline() -> None:
             device=device,
         )
         reddit_doc_info = reddit_topic_model.get_document_info(cleaned_reddit)
-        reddit_doc_info_path = out_path(f"reddit_doc_info_{today}.ndjson")
+        reddit_doc_info_path = out_path(f"logs/reddit_doc_info_{today}.ndjson")
         reddit_doc_info.to_json(reddit_doc_info_path, orient="records", lines=True, force_ascii=False)
         print(f"[Save] {reddit_doc_info_path}")
     else:
@@ -254,7 +260,7 @@ def run_pipeline() -> None:
             device=device,
         )
         poly_doc_info = poly_topic_model.get_document_info(cleaned_poly)
-        poly_doc_info_path = out_path(f"poly_doc_info_{today}.ndjson")
+        poly_doc_info_path = out_path(f"logs/poly_doc_info_{today}.ndjson")
         poly_doc_info.to_json(poly_doc_info_path, orient="records", lines=True, force_ascii=False)
         print(f"[Save] {poly_doc_info_path}")
     else:
@@ -336,10 +342,23 @@ def run_pipeline() -> None:
             top_n_words=10,
         )
 
-    aligned_out_path = out_path(f"aligned_topics_full_{today}.json")
+    aligned_out_path = out_path(f"nlp_outputs/aligned_topics_full_{today}.json")
     with open(aligned_out_path, "w", encoding="utf-8") as f:
         json.dump(aligned_full, f, indent=2, ensure_ascii=False, default=json_default)
     print(f"[Save] {aligned_out_path}")
+    
+    if PUSH_ALIGNED_TO_SQL:
+        try:
+            t, g, p, r = load_aligned_topics_to_sql(
+                aligned_out_path,
+                default_group_id=ALIGNED_DEFAULT_GROUP,  # None = use group_id from items
+            )
+            print(f"[SQL] Aligned → MySQL  | Topic: {t}  GroupTopic: {g}  PolymarketDoc: {p}  RedditDoc: {r}")
+        except Exception as e:
+            import traceback
+            print(f"[SQL] Failed loading aligned JSON → {e}")
+            print(traceback.format_exc())
+
 
     # 6) Optional LLM summarization → SQL
     if RUN_LITELLM:

@@ -420,7 +420,7 @@ def _find_latest_aligned(save_dir: str = SAVE_DIR_DEFAULT) -> str:
     """
     candidates: List[str] = []
     candidates += glob(str(Path(save_dir) / "aligned_topics_full_*.json"))
-    candidates += glob("data/outputs/aligned_topics_full_*.json")
+    candidates += glob("public/files/nlp_outputs/aligned_topics_full_*.json")
     if not candidates:
         raise FileNotFoundError("No aligned_topics_full_*.json found.")
     candidates.sort(key=lambda p: os.path.getmtime(p))

@@ -1,153 +1,145 @@
-import os, json, argparse
+# upload_trends.py
+from __future__ import annotations
+import json, decimal
+from typing import Any, Dict, Iterable, Optional
 import mysql.connector as mysql
-from dotenv import load_dotenv
-import re
 
-load_dotenv()
-DB = {
-    "host": os.getenv("MYSQL_HOST", "127.0.0.1"),
-    "port": int(os.getenv("MYSQL_PORT", "3306")),
-    "user": os.getenv("MYSQL_USER", "root"),
-    "password": os.getenv("MYSQL_PASSWORD", ""),
-    "database": os.getenv("MYSQL_DB", "periscope"),
-}
-LLM_MODEL = os.getenv("LITELLM_MODEL", "vertex_ai/gemini-2.5-pro")
+DEC = decimal.Decimal
 
+def get_conn():
+    return mysql.connect(
+        host="127.0.0.1",
+        port=3306,
+        user="periscope",
+        password="periscope_pw",
+        database="periscope",
+        autocommit=False,
+    )
 
-def outlook_to_enum(s: str) -> str | None:
-    """
-    Strip emojis and return clean outlook string.
-    Returns None if missing.
-    
-    """
-    if s == "↔️ Stable Trend" or s == "Stable Trend":
-        return "Stable Trend"
-    if s == "📈 Moderate Growth" or s == "Moderate Growth":
-        return "Stable Trend"
-    if s == "📉 Declining Signal" or s == "Declining Signal":
-        return "Declining Signal"
-    if s == "🚀 Breakout Potential" or s == "Breakout Potential":
-        return "Breakout Potential"
-    
-    return None
-        
-    
+def _num(x, typ=float):
+    try:
+        if x is None or x == "":
+            return None
+        return typ(x)
+    except Exception:
+        return None
 
-
-def watch_to_enum(flag: str) -> str:
-    if not flag: return "none"
-    return "watch" if str(flag).lower().startswith("y") else "none"
-
-def as_json(val):
-    return json.dumps(val, ensure_ascii=False) if val is not None else None
-
-def bool_to_tinyint(b):
-    if b is True: return 1
-    if b is False: return 0
-    return None
-
-def platform_spread(platforms_present):
-    d = {}
-    if isinstance(platforms_present, list):
-        for p in platforms_present:
-            d[str(p)] = True
-    return d or None
-
-UPSERT_TREND = """
-INSERT INTO trend_signal_output
-(trend_id, group_id, headline, tldr,
- trend_tags_json, industry_tags_json, cross_platform, platform_spread_json,
- historical_analogues_json, quotes_citations_json, narrative_analysis,
- confidence_score, confidence_score_explanation, watch_flag, watch_rationale,
- created_llm_model)
-VALUES
-(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-ON DUPLICATE KEY UPDATE
-  group_id=VALUES(group_id),
-  headline=VALUES(headline),
-  tldr=VALUES(tldr),
-  trend_tags_json=VALUES(trend_tags_json),
-  industry_tags_json=VALUES(industry_tags_json),
-  cross_platform=VALUES(cross_platform),
-  platform_spread_json=VALUES(platform_spread_json),
-  historical_analogues_json=VALUES(historical_analogues_json),
-  quotes_citations_json=VALUES(quotes_citations_json),
-  narrative_analysis=VALUES(narrative_analysis),
-  confidence_score=VALUES(confidence_score),
-  confidence_score_explanation=VALUES(confidence_score_explanation),
-  watch_flag=VALUES(watch_flag),
-  watch_rationale=VALUES(watch_rationale),
-  created_llm_model=VALUES(created_llm_model)
-"""
-
-UPSERT_GRID = """
-INSERT INTO prediction_grid (group_id, outlook, why, break_point_alerts)
-VALUES (%s,%s,%s,%s)
-ON DUPLICATE KEY UPDATE
-  outlook=VALUES(outlook),
-  why=VALUES(why),
-  break_point_alerts=VALUES(break_point_alerts)
-"""
-
-def load_trends(json_path: str) -> int:
-    with open(json_path, "r", encoding="utf-8") as f:
-        root = json.load(f)
-
-    trends = root.get("trends", [])
-    cn = mysql.connect(**DB); cn.autocommit = False
-    cur = cn.cursor()
-
-    rows = 0
-    for tb in trends:
-        group_id = tb.get("group_id")
-        trend_id = tb.get("trend_id")
-        if group_id is None or trend_id is None:
-            continue
-
-        watch = tb.get("watch") or {}
-        pred  = tb.get("prediction_grid") or {}
-
+def upsert_trend_group(cur, group_id: Optional[int], label: Optional[str]) -> int:
+    if group_id:
         cur.execute(
-            UPSERT_TREND,
-            (
-                trend_id, group_id,
-                tb.get("headline"),
-                tb.get("tldr"),
-                as_json(tb.get("trend_tags")),
-                as_json(tb.get("industry_tags")),
-                bool_to_tinyint(tb.get("cross_platform")),
-                as_json(platform_spread(tb.get("platforms_present"))),
-                as_json(tb.get("historical_analogues")),
-                as_json(tb.get("quotes_citations")),
-                tb.get("narrative_analysis"),
-                tb.get("confidence_score"),
-                tb.get("confidence_score_explanation"),
-                watch_to_enum(watch.get("flag")),
-                watch.get("rationale"),
-                LLM_MODEL,
-            ),
+            "INSERT INTO trend_group (group_id, label) VALUES (%s,%s) "
+            "ON DUPLICATE KEY UPDATE label=COALESCE(VALUES(label), label)",
+            (group_id, label),
         )
+        return group_id
+    cur.execute("INSERT INTO trend_group (label) VALUES (%s)", (label,))
+    return cur.lastrowid
 
-        cur.execute(
-            UPSERT_GRID,
-            (
-                group_id,
-                outlook_to_enum(pred.get("outlook")),
-                pred.get("why"),
-                pred.get("break_point_alerts"),
-            ),
-        )
-        rows += 1
+def upsert_trend_signal(
+    cur,
+    group_id: int,
+    headline: str,
+    tldr: Optional[str],
+    trend_tags_json: Optional[dict],
+    industry_tags_json: Optional[dict],
+    cross_platform: Optional[bool],
+    platform_spread_json: Optional[dict],
+    historical_analogues_json: Optional[dict],
+    quotes_citations_json: Optional[dict],
+    narrative_analysis: Optional[str],
+    confidence_score: Optional[decimal.Decimal],
+    confidence_score_explanation: Optional[str],
+    watch_flag: Optional[str],  # enum in your table — pass as string ('0'/'1' or named)
+    watch_rationale: Optional[str],
+    created_llm_model: Optional[str],
+):
+    cur.execute(
+        """
+        INSERT INTO trend_signal
+          (group_id, headline, tldr, trend_tags_json, industry_tags_json,
+           cross_platform, platform_spread_json, historical_analogues_json,
+           quotes_citations_json, narrative_analysis, confidence_score,
+           confidence_score_explanation, watch_flag, watch_rationale,
+           created_date, created_llm_model, created_at)
+        VALUES
+          (%s,%s,%s,%s,%s,
+           %s,%s,%s,
+           %s,%s,%s,
+           %s,%s,%s,
+           CURDATE(), %s, NOW())
+        """,
+        (
+            group_id, headline, tldr,
+            json.dumps(trend_tags_json, ensure_ascii=False) if trend_tags_json is not None else None,
+            json.dumps(industry_tags_json, ensure_ascii=False) if industry_tags_json is not None else None,
+            1 if cross_platform else 0 if cross_platform is not None else None,
+            json.dumps(platform_spread_json, ensure_ascii=False) if platform_spread_json is not None else None,
+            json.dumps(historical_analogues_json, ensure_ascii=False) if historical_analogues_json is not None else None,
+            json.dumps(quotes_citations_json, ensure_ascii=False) if quotes_citations_json is not None else None,
+            narrative_analysis,
+            _num(confidence_score, DEC),
+            confidence_score_explanation,
+            watch_flag,  # if it’s enum like ('Y','N') pass those, else coerce to '1'/'0'
+            watch_rationale,
+            created_llm_model,
+        ),
+    )
 
-    cn.commit()
-    cur.close(); cn.close()
-    return rows
+def load_trends_json(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        # Accept either a plain list or {"trends": [...]}
+        data = json.load(f)
+        if isinstance(data, dict) and "trends" in data:
+            return data
+        if isinstance(data, list):
+            return {"trends": data}
+        return {"trends": data.get("data", [])}
+
+def upload_trends(trends_doc: Dict[str, Any]) -> int:
+    inserted = 0
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        for tr in trends_doc.get("trends", []):
+            # Common fields you likely have in your LLM output
+            group = tr.get("group") or {}
+            group_id = group.get("group_id")
+            group_label = group.get("label") or tr.get("group_label")
+
+            gid = upsert_trend_group(cur, group_id, group_label)
+
+            upsert_trend_signal(
+                cur=cur,
+                group_id=gid,
+                headline=tr.get("headline") or tr.get("title") or "Untitled",
+                tldr=tr.get("tldr") or tr.get("summary"),
+                trend_tags_json=tr.get("trend_tags"),
+                industry_tags_json=tr.get("industry_tags"),
+                cross_platform=tr.get("cross_platform"),
+                platform_spread_json=tr.get("platform_spread"),
+                historical_analogues_json=tr.get("historical_analogues"),
+                quotes_citations_json=tr.get("quotes_citations"),
+                narrative_analysis=tr.get("narrative"),
+                confidence_score=tr.get("confidence_score"),
+                confidence_score_explanation=tr.get("confidence_score_explanation"),
+                watch_flag=str(tr.get("watch_flag")) if tr.get("watch_flag") is not None else None,
+                watch_rationale=tr.get("watch_rationale"),
+                created_llm_model=tr.get("model"),
+            )
+            inserted += 1
+
+        conn.commit()
+        return inserted
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 if __name__ == "__main__":
-    import argparse, os
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--path",
-        default=os.path.join("public","files","api_app_outputs","all_trends_2025_09_08_171009.json"))
-    args = parser.parse_args()
-    count = load_trends(args.path)
-    print(f"Trend briefs loaded: {count} rows (trend_signal_output + prediction_grid by group_id)")
+    import sys
+    path = sys.argv[1]
+    trends = load_trends_json(path)
+    n = upload_trends(trends)
+    print(f"Inserted trend_signal rows: {n}")

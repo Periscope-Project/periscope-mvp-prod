@@ -2,7 +2,54 @@ import pandas as pd
 import numpy as np
 import re
 import html
+
+from pathlib import Path
+import os, sys
+from pathlib import Path
 import nltk
+
+# Prefer env → vendor → venv → defaults
+VENDOR_NLTK = Path(__file__).resolve().parents[2] / "vendor" / "nltk_data"
+CANDIDATE_DIRS = [
+    os.getenv("NLTK_DATA"),
+    str(VENDOR_NLTK),
+    str(Path(sys.prefix) / "nltk_data"),  # venv/local site
+]
+# Prepend in order (keep any existing)
+for p in [d for d in CANDIDATE_DIRS if d]:
+    if p not in nltk.data.path:
+        nltk.data.path.insert(0, p)
+
+REQUIRED = [
+    ("corpora/stopwords", "stopwords"),
+    ("tokenizers/punkt", "punkt"),
+    ("corpora/wordnet", "wordnet"),
+    ("corpora/omw-1.4", "omw-1.4"),
+]
+
+def _nltk_has(resource_key: str) -> bool:
+    try:
+        nltk.data.find(resource_key)
+        return True
+    except LookupError:
+        return False
+
+_missing = [name for key, name in REQUIRED if not _nltk_has(key)]
+
+# Zero-download production: error clearly if vendor missing.
+# If you *do* want automatic download fallback on fresh EC2, set ALLOW_NLTK_DOWNLOAD=1 in env.
+if _missing:
+    if os.getenv("ALLOW_NLTK_DOWNLOAD") == "1":
+        for _, name in REQUIRED:
+            nltk.download(name, download_dir=str(VENDOR_NLTK), quiet=True)
+        _missing = [name for key, name in REQUIRED if not _nltk_has(key)]
+    if _missing:
+        raise RuntimeError(
+            f"Missing NLTK data: {_missing}. "
+            f"Ensure repo contains vendor/nltk_data or set NLTK_DATA to that path."
+        )
+
+
 from typing import Any, Dict, List, Tuple
 import json
 
@@ -16,6 +63,8 @@ from nltk.corpus import stopwords
 from nltk.tokenize.toktok import ToktokTokenizer
 from transformers import AutoTokenizer
 from gensim.models.phrases import Phrases, Phraser
+import matplotlib
+matplotlib.use("Agg") 
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -50,13 +99,8 @@ def _find_label_col(df: pd.DataFrame) -> str | None:
 
 
 def _ensure_nltk():
-    try:
-        nltk.data.find("corpora/stopwords")
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("stopwords", quiet=True)
-        nltk.download("punkt", quiet=True)
-        nltk.download("omw-1.4", quiet=True)
+    for key in ["corpora/stopwords","tokenizers/punkt","corpora/wordnet","corpora/omw-1.4"]:
+        nltk.data.find(key)
 
 
 _ensure_nltk()
@@ -299,42 +343,6 @@ def _coerce_dict(x: Any) -> Dict[str, Any]:
                 continue
     return {}
 
-def _build_snapshot_text(rec: Dict[str, Any], include_tag: bool, include_outcomes: bool, include_slug: bool) -> str:
-    # Prefer flattened fields (what your enrich_data outputs)
-    q = rec.get("question")
-    slug = rec.get("slug")
-    tag_label = rec.get("tag_label")
-    outs = rec.get("outcomes")
-
-    # Fallbacks to nested if present
-    market = _coerce_dict(rec.get("market"))
-    tag = _coerce_dict(rec.get("tag"))
-
-    if not q:
-        q = market.get("question") or market.get("title")
-    if include_slug and not slug:
-        slug = market.get("slug")
-    if include_tag and not tag_label:
-        tag_label = tag.get("label")
-
-    outs_txt = ""
-    if include_outcomes:
-        outs = _maybe_json(outs) if outs is not None else _maybe_json(market.get("outcomes"))
-        if isinstance(outs, (list, tuple)):
-            outs_txt = " | ".join(map(str, outs[:6]))
-        elif outs:
-            outs_txt = str(outs)
-
-    parts = []
-    if include_tag and tag_label:
-        parts.append(str(tag_label).strip())
-    if q:
-        parts.append(str(q).strip())
-    if include_slug and slug:
-        parts.append(str(slug).strip())
-    if outs_txt:
-        parts.append(outs_txt.strip())
-    return " ".join(p for p in parts if p)
 
 def _build_event_text(rec: Dict[str, Any], include_title: bool, include_description: bool, include_all_questions: bool) -> str:
     # Legacy event-style fallback (kept for compatibility)
@@ -555,7 +563,7 @@ def get_topic_similarity_heatmap(
     plt.ylabel("Reddit Topics")
     plt.tight_layout()
     #save to output
-    plt.savefig("data/outputs/topic_overlap_heatmap.png")
+    plt.savefig("/topic_overlap_heatmap.png")
 
 
 if __name__ == "__main__":
@@ -572,11 +580,22 @@ if __name__ == "__main__":
     from datetime import datetime
     import pandas as pd
     import numpy as np
-    import polymarket_features as pf
+    
+
+    
+    # ensure repo root is on sys.path
+    REPO_ROOT = Path(__file__).resolve().parents[2]  # adjust if needed
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+        
+    os.chdir(REPO_ROOT)
+    print(os.getcwd())
+
+    import src.sources.polymarket.polymarket_features as pf
+ 
     # ---------- paths ----------
-    REPO_ROOT = Path(__file__).resolve().parents[1]   # repo/
-    DAILY_DIR = REPO_ROOT / "data" / "daily"
-    OUT_DIR   = REPO_ROOT / "data" / "outputs"
+    DAILY_DIR = REPO_ROOT / "public/files/source_data"
+    OUT_DIR   = REPO_ROOT / "public/files" / "nlp_outputs"
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ---------- helpers ----------
@@ -612,9 +631,9 @@ if __name__ == "__main__":
         return []
 
     # ---------- pick freshest inputs ----------
-    reddit_path = _latest("reddit_daily_all_*.ndjson") or _latest("reddit_daily_all_*.json")
-    popular_path = _latest("reddit_popular_*.ndjson")  # optional
-    poly_path = _latest("polymarket_*.jsonl")
+    reddit_path = _latest("reddit/reddit_daily_all_*.ndjson") or _latest("reddit/reddit_daily_all_*.json")
+    popular_path = _latest("reddit/reddit_popular_*.ndjson")  # optional
+    poly_path = _latest("polymarket/polymarket_*.jsonl")
 
     print("Inputs detected:")
     print("  Reddit all : ", reddit_path)
